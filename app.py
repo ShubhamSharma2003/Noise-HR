@@ -3,36 +3,14 @@ HR Multi-Agent System — Streamlit UI
 Run with: streamlit run app.py
 """
 import os
+import json
+import requests as _requests
 import streamlit as st
 from openai import OpenAI
 from hr_system.freshteam import FreshteamClient
 from hr_system.graph import hr_graph
 
-@st.cache_data(show_spinner=False)
-def format_resume(raw_text: str) -> str:
-    """Use GPT-4o to parse raw resume text into clean structured markdown."""
-    if not raw_text or len(raw_text.strip()) < 20:
-        return "_No resume content available._"
-    response = OpenAI(api_key=os.environ.get("OPENAI_API_KEY")).chat.completions.create(
-        model="gpt-4o",
-        max_tokens=1500,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a resume parser. Given raw text extracted from a resume file, "
-                    "reformat it into clean, structured markdown with these sections (only include "
-                    "sections that have actual data): \n"
-                    "## Name\n## Contact\n## Summary\n## Experience\n## Education\n## Skills\n## Certifications\n\n"
-                    "Use bullet points for lists. If the input does not look like a resume at all, "
-                    "respond with exactly: `[Not a resume — raw content shown below]`"
-                ),
-            },
-            {"role": "user", "content": raw_text[:6000]},
-        ],
-    )
-    return response.choices[0].message.content.strip()
-
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="HR Agent System", page_icon="🧑‍💼", layout="wide")
 
 st.markdown("""
@@ -74,6 +52,30 @@ st.caption("Powered by LangGraph + OpenAI · Connected to Freshteam")
 st.divider()
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
+
+@st.cache_data(show_spinner=False)
+def format_resume(raw_text: str) -> str:
+    if not raw_text or len(raw_text.strip()) < 20:
+        return "_No resume content available._"
+    response = OpenAI(api_key=os.environ.get("OPENAI_API_KEY")).chat.completions.create(
+        model="gpt-4o",
+        max_tokens=1500,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a resume parser. Given raw text extracted from a resume file, "
+                    "reformat it into clean, structured markdown with these sections (only include "
+                    "sections that have actual data): \n"
+                    "## Name\n## Contact\n## Summary\n## Experience\n## Education\n## Skills\n## Certifications\n\n"
+                    "Use bullet points for lists. If the input does not look like a resume at all, "
+                    "respond with exactly: `[Not a resume — raw content shown below]`"
+                ),
+            },
+            {"role": "user", "content": raw_text[:6000]},
+        ],
+    )
+    return response.choices[0].message.content.strip()
 
 @st.cache_data(show_spinner="Fetching jobs from Freshteam...", ttl=60)
 def load_jobs():
@@ -142,458 +144,500 @@ def render_audit(history):
             unsafe_allow_html=True,
         )
 
-# ── Job selector (shared across tabs) ────────────────────────────────────────
-jobs = load_jobs()
-if jobs:
-    job_map = {f"{j.get('title','Untitled')} (#{j['id']})": j["id"] for j in jobs}
-    job_label = st.selectbox("Job Posting", list(job_map.keys()))
-    job_id = job_map[job_label]
-else:
-    st.warning("Could not load jobs from Freshteam. Select or add a Job ID below.")
-    if "manual_job_ids" not in st.session_state:
-        st.session_state.manual_job_ids = [2000073751]
-    if "job_titles" not in st.session_state:
-        st.session_state.job_titles = {}
-    col_sel, col_inp, col_btn = st.columns([3, 2, 1])
-    job_id = col_sel.selectbox(
-        "Job ID",
-        options=st.session_state.manual_job_ids,
-        format_func=lambda jid: f"{st.session_state.job_titles[jid]} (#{jid})" if jid in st.session_state.job_titles else str(jid),
-    )
-    new_id = col_inp.text_input("Add Job ID")
-    col_btn.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
-    if col_btn.button("Add", key="add_job_id") and new_id and int(new_id) not in st.session_state.manual_job_ids:
-        st.session_state.manual_job_ids.append(int(new_id))
-        st.rerun()
-
-applicants = load_applicants(job_id)
-# Cache job title from applicant data so it shows in the selector
-if applicants and "job_titles" in st.session_state:
-    title = next((a.get("job_title") for a in applicants if a.get("job_title")), None)
-    if title and st.session_state.job_titles.get(job_id) != title:
-        st.session_state.job_titles[job_id] = title
-        st.rerun()
-if not applicants:
-    st.warning("No applicants found for this job.")
-    st.stop()
-
-st.caption(f"{len(applicants)} applicant(s) found")
-st.divider()
-
-# ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_rank, tab_single, tab_linkedin = st.tabs(["📊 Rank All Applicants", "🔍 Single Applicant", "🔗 LinkedIn Sourcing"])
+# ════════════════════════════════════════════════════════════════════════════════
+# TOP-LEVEL TABS
+# ════════════════════════════════════════════════════════════════════════════════
+main_tab_screening, main_tab_requisition = st.tabs(["📋 Resume Screening", "📝 Requisition Form"])
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 1 — Rank All
+# MAIN TAB 1 — Resume Screening
 # ════════════════════════════════════════════════════════════════════════════════
-with tab_rank:
-    st.subheader("Rank All Applicants by Resume Fit")
-    st.caption("Screens every applicant and sorts them best-to-worst by AI confidence score.")
+with main_tab_screening:
 
-    ranked_key = f"ranked_results_{job_id}"
-
-    # Clear stored results if job changes
-    for k in list(st.session_state.keys()):
-        if k.startswith("ranked_results_") and k != ranked_key:
-            del st.session_state[k]
-
-    if st.button("Screen & Rank All", type="primary", key="rank_all"):
-        results = []
-        progress = st.progress(0, text="Starting...")
-        status_box = st.empty()
-
-        for i, app in enumerate(applicants):
-            name = applicant_label(app)
-            aid = app["id"]
-            status_box.info(f"Screening {i+1}/{len(applicants)}: **{name}**...")
-            try:
-                final_state, task_input = run_screening(job_id, aid)
-                agent_out = final_state.get("agent_output") or {}
-                confidence = agent_out.get("confidence_score", 0.0)
-                results.append({
-                    "name": name,
-                    "applicant_id": aid,
-                    "confidence": confidence,
-                    "final_state": final_state,
-                    "task_input": task_input,
-                })
-            except Exception as e:
-                results.append({
-                    "name": name,
-                    "applicant_id": aid,
-                    "confidence": -1,
-                    "error": str(e),
-                    "final_state": {},
-                    "task_input": {},
-                })
-            progress.progress((i + 1) / len(applicants), text=f"{i+1}/{len(applicants)} screened")
-
-        status_box.empty()
-        progress.empty()
-
-        results.sort(key=lambda r: r["confidence"], reverse=True)
-        st.session_state[ranked_key] = results
-        st.rerun()
-
-    if ranked_key in st.session_state:
-        results = st.session_state[ranked_key]
-        st.success(f"Done! Ranked {len(results)} applicants.")
-
-        # ── Keyword filter (operates on already-fetched resume text) ──────────
-        st.divider()
-        kw_col, btn_col, clear_col = st.columns([4, 1.2, 1])
-        kw_input = kw_col.text_input(
-            "kw_rank_label",
-            placeholder="Filter by keywords (comma-separated) — e.g. Chandigarh University, entrepreneur, AWS",
-            label_visibility="collapsed",
-            key="kw_rank_input",
+    # ── Job selector ──────────────────────────────────────────────────────────
+    jobs = load_jobs()
+    if jobs:
+        job_map = {f"{j.get('title','Untitled')} (#{j['id']})": j["id"] for j in jobs}
+        job_label = st.selectbox("Job Posting", list(job_map.keys()))
+        job_id = job_map[job_label]
+    else:
+        st.warning("Could not load jobs from Freshteam. Select or add a Job ID below.")
+        if "manual_job_ids" not in st.session_state:
+            st.session_state.manual_job_ids = [2000073751]
+        if "job_titles" not in st.session_state:
+            st.session_state.job_titles = {}
+        col_sel, col_inp, col_btn = st.columns([3, 2, 1])
+        job_id = col_sel.selectbox(
+            "Job ID",
+            options=st.session_state.manual_job_ids,
+            format_func=lambda jid: f"{st.session_state.job_titles[jid]} (#{jid})" if jid in st.session_state.job_titles else str(jid),
         )
-        apply_kw_rank = btn_col.button("🔍 Filter", key="apply_kw_rank")
-        clear_kw_rank = clear_col.button("✕ Clear", key="clear_kw_rank")
-
-        if clear_kw_rank:
-            st.session_state.pop("kw_rank_active", None)
-            st.session_state.pop("kw_rank_matched", None)
+        new_id = col_inp.text_input("Add Job ID")
+        col_btn.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
+        if col_btn.button("Add", key="add_job_id") and new_id and int(new_id) not in st.session_state.manual_job_ids:
+            st.session_state.manual_job_ids.append(int(new_id))
             st.rerun()
 
-        if apply_kw_rank and kw_input.strip():
-            # ALL keywords must match (AND logic) — profile included only if every keyword is found
-            keywords = [k.strip() for k in kw_input.split(",") if k.strip()]
-            matched = []
-            oai_kw = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-            prog_kw = st.progress(0, text="Filtering...")
-            for i, r in enumerate(results):
-                resume_text = r.get("task_input", {}).get("resume_text", "") or r.get("name", "")
-                # Normalize whitespace so multi-word phrases survive PDF line breaks
-                resume_normalized = " ".join(resume_text.split()).lower()
-                all_matched = True
-                for kw in keywords:
-                    kw_lower = kw.lower()
-                    kw_found = False
-                    # Fast path: literal match
-                    if kw_lower in resume_normalized:
-                        kw_found = True
-                    else:
-                        # Semantic fallback via AI
-                        try:
-                            resp = oai_kw.chat.completions.create(
-                                model="gpt-4o-mini",
-                                max_tokens=10,
-                                messages=[
-                                    {
-                                        "role": "system",
-                                        "content": (
-                                            "You are a smart candidate filter. Given a keyword/phrase and a resume, "
-                                            "reply ONLY 'yes' or 'no': does this resume match the keyword concept?\n"
-                                            "Be semantically intelligent:\n"
-                                            "- 'entrepreneur' → co-founded, startup founder, own business\n"
-                                            "- 'tier 1 college' → IIT, IIM, IISc, NIT, top-ranked university\n"
-                                            "- 'fintech' → payments, banking tech, neo-bank, lending\n"
-                                            "Match intent, not just exact words."
-                                        ),
-                                    },
-                                    {
-                                        "role": "user",
-                                        "content": f"Keyword: {kw}\n\nResume:\n{resume_text[:3000]}",
-                                    },
-                                ],
-                            )
-                            if resp.choices[0].message.content.strip().lower().startswith("yes"):
-                                kw_found = True
-                        except Exception:
-                            kw_found = True
-                    if not kw_found:
-                        all_matched = False
-                        break
-                if all_matched:
-                    matched.append(r["applicant_id"])
-                prog_kw.progress((i + 1) / len(results))
-            prog_kw.empty()
-            st.session_state["kw_rank_active"] = kw_input.strip()
-            st.session_state["kw_rank_matched"] = matched
+    applicants = load_applicants(job_id)
+    if applicants and "job_titles" in st.session_state:
+        title = next((a.get("job_title") for a in applicants if a.get("job_title")), None)
+        if title and st.session_state.job_titles.get(job_id) != title:
+            st.session_state.job_titles[job_id] = title
+            st.rerun()
+    if not applicants:
+        st.warning("No applicants found for this job.")
+        st.stop()
+
+    st.caption(f"{len(applicants)} applicant(s) found")
+    st.divider()
+
+    # ── Sub-tabs ──────────────────────────────────────────────────────────────
+    tab_rank, tab_single, tab_linkedin = st.tabs(["📊 Rank All Applicants", "🔍 Single Applicant", "🔗 LinkedIn Sourcing"])
+
+    # ── Sub-tab 1: Rank All ───────────────────────────────────────────────────
+    with tab_rank:
+        st.subheader("Rank All Applicants by Resume Fit")
+        st.caption("Screens every applicant and sorts them best-to-worst by AI confidence score.")
+
+        ranked_key = f"ranked_results_{job_id}"
+        for k in list(st.session_state.keys()):
+            if k.startswith("ranked_results_") and k != ranked_key:
+                del st.session_state[k]
+
+        if st.button("Screen & Rank All", type="primary", key="rank_all"):
+            results = []
+            progress = st.progress(0, text="Starting...")
+            status_box = st.empty()
+
+            for i, app in enumerate(applicants):
+                name = applicant_label(app)
+                aid = app["id"]
+                status_box.info(f"Screening {i+1}/{len(applicants)}: **{name}**...")
+                try:
+                    final_state, task_input = run_screening(job_id, aid)
+                    agent_out = final_state.get("agent_output") or {}
+                    confidence = agent_out.get("confidence_score", 0.0)
+                    results.append({
+                        "name": name,
+                        "applicant_id": aid,
+                        "confidence": confidence,
+                        "final_state": final_state,
+                        "task_input": task_input,
+                    })
+                except Exception as e:
+                    results.append({
+                        "name": name,
+                        "applicant_id": aid,
+                        "confidence": -1,
+                        "error": str(e),
+                        "final_state": {},
+                        "task_input": {},
+                    })
+                progress.progress((i + 1) / len(applicants), text=f"{i+1}/{len(applicants)} screened")
+
+            status_box.empty()
+            progress.empty()
+            results.sort(key=lambda r: r["confidence"], reverse=True)
+            st.session_state[ranked_key] = results
             st.rerun()
 
-        # Apply active filter to display list
-        display_results = results
-        if st.session_state.get("kw_rank_active"):
-            matched_set = set(st.session_state["kw_rank_matched"])
-            display_results = [r for r in results if r["applicant_id"] in matched_set]
-            active_kws = st.session_state["kw_rank_active"]
-            kw_label = " · ".join(f'**"{k.strip()}"**' for k in active_kws.split(",") if k.strip())
-            st.info(
-                f"🔍 Keywords: {kw_label} "
-                f"— {len(display_results)} of {len(results)} profile(s) matched."
+        if ranked_key in st.session_state:
+            results = st.session_state[ranked_key]
+            st.success(f"Done! Ranked {len(results)} applicants.")
+
+            st.divider()
+            kw_col, btn_col, clear_col = st.columns([4, 1.2, 1])
+            kw_input = kw_col.text_input(
+                "kw_rank_label",
+                placeholder="Filter by keywords (comma-separated) — e.g. Chandigarh University, entrepreneur, AWS",
+                label_visibility="collapsed",
+                key="kw_rank_input",
             )
-            if not display_results:
-                st.warning("No profiles matched. Try different keywords or click **✕ Clear**.")
+            apply_kw_rank = btn_col.button("🔍 Filter", key="apply_kw_rank")
+            clear_kw_rank = clear_col.button("✕ Clear", key="clear_kw_rank")
 
-        st.divider()
-
-        for rank, r in enumerate(display_results, 1):
-            fs = r["final_state"]
-            conf = r["confidence"]
-            error = r.get("error")
-
-            with st.container():
-                col_rank, col_info, col_conf, col_badge = st.columns([0.5, 3, 2, 2])
-
-                col_rank.markdown(f'<div class="rank-number">#{rank}</div>', unsafe_allow_html=True)
-                ft_url = f"https://gonoise.freshteam.com/hire/jobs/{job_id}/applicants/listview/{r['applicant_id']}"
-                col_info.markdown(
-                    f"**{r['name']}**  \nID: `{r['applicant_id']}` &nbsp; "
-                    f'<a href="{ft_url}" target="_blank" style="text-decoration:none;">'
-                    f'<button style="padding:2px 10px;font-size:12px;border-radius:5px;border:1px solid #ccc;'
-                    f'background:#f0f2f6;cursor:pointer;">🔗 Freshteam Profile</button></a>',
-                    unsafe_allow_html=True,
-                )
-
-                if error:
-                    col_conf.caption("Error")
-                    col_badge.markdown('<span class="verdict-escalated">⚠️ Error</span>', unsafe_allow_html=True)
-                else:
-                    col_conf.progress(max(conf, 0), text=f"{conf:.0%} fit")
-                    col_badge.markdown(verdict_badge(fs), unsafe_allow_html=True)
-
-                with st.expander("View full result"):
-                    if error:
-                        st.error(error)
-                    else:
-                        res_tab, result_tab, audit_tab = st.tabs(["📄 Resume", "🤖 AI Result", "🕵️ Audit"])
-                        with res_tab:
-                            raw = r["task_input"].get("resume_text", "")
-                            if raw:
-                                with st.spinner("Formatting resume..."):
-                                    st.markdown(format_resume(raw))
-                            else:
-                                st.caption("No resume file attached.")
-                        with result_tab:
-                            st.markdown(fs.get("final_result", "_(no result)_"))
-                        with audit_tab:
-                            render_audit(fs.get("history", []))
-
-                st.divider()
-
-# ════════════════════════════════════════════════════════════════════════════════
-# TAB 2 — Single Applicant
-# ════════════════════════════════════════════════════════════════════════════════
-with tab_single:
-    st.subheader("Single Applicant")
-
-    app_map = {applicant_label(a): a["id"] for a in applicants}
-    selected_label = st.selectbox("Applicant", list(app_map.keys()))
-    applicant_id = app_map[selected_label]
-
-    action = st.radio("Action", ["Screen Resume", "Schedule Interview"], horizontal=True)
-
-    if action == "Schedule Interview":
-        import datetime
-        if "slot_count" not in st.session_state:
-            st.session_state.slot_count = 1
-
-        slots = []
-        for si in range(st.session_state.slot_count):
-            c_date, c_time, c_del = st.columns([3, 2, 0.5])
-            default_date = datetime.date.today() + datetime.timedelta(days=6 + si)
-            d = c_date.date_input(f"Slot {si+1} — Date", value=default_date, key=f"slot_date_{si}")
-            t = c_time.time_input(f"Slot {si+1} — Time (IST)", value=datetime.time(10, 0), key=f"slot_time_{si}", step=900)
-            slot_iso = f"{d.strftime('%Y-%m-%d')}T{t.strftime('%H:%M')}+05:30"
-            slots.append(slot_iso)
-            if st.session_state.slot_count > 1:
-                if c_del.button("✕", key=f"del_slot_{si}", help="Remove slot"):
-                    st.session_state.slot_count -= 1
-                    st.rerun()
-
-        if st.session_state.slot_count < 5:
-            if st.button("＋ Add slot", key="add_slot"):
-                st.session_state.slot_count += 1
+            if clear_kw_rank:
+                st.session_state.pop("kw_rank_active", None)
+                st.session_state.pop("kw_rank_matched", None)
                 st.rerun()
 
-    if st.button("Run Agent", type="primary", key="single_run"):
-        with st.spinner("Running..."):
-            if action == "Screen Resume":
-                final_state, task_input = run_screening(job_id, applicant_id)
-            else:
-                final_state, task_input = run_scheduling(job_id, applicant_id, slots)
+            if apply_kw_rank and kw_input.strip():
+                keywords = [k.strip() for k in kw_input.split(",") if k.strip()]
+                matched = []
+                oai_kw = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+                prog_kw = st.progress(0, text="Filtering...")
+                for i, r in enumerate(results):
+                    resume_text = r.get("task_input", {}).get("resume_text", "") or r.get("name", "")
+                    resume_normalized = " ".join(resume_text.split()).lower()
+                    all_matched = True
+                    for kw in keywords:
+                        kw_lower = kw.lower()
+                        kw_found = False
+                        if kw_lower in resume_normalized:
+                            kw_found = True
+                        else:
+                            try:
+                                resp = oai_kw.chat.completions.create(
+                                    model="gpt-4o-mini",
+                                    max_tokens=10,
+                                    messages=[
+                                        {
+                                            "role": "system",
+                                            "content": (
+                                                "You are a smart candidate filter. Given a keyword/phrase and a resume, "
+                                                "reply ONLY 'yes' or 'no': does this resume match the keyword concept?\n"
+                                                "Be semantically intelligent:\n"
+                                                "- 'entrepreneur' → co-founded, startup founder, own business\n"
+                                                "- 'tier 1 college' → IIT, IIM, IISc, NIT, top-ranked university\n"
+                                                "- 'fintech' → payments, banking tech, neo-bank, lending\n"
+                                                "Match intent, not just exact words."
+                                            ),
+                                        },
+                                        {"role": "user", "content": f"Keyword: {kw}\n\nResume:\n{resume_text[:3000]}"},
+                                    ],
+                                )
+                                if resp.choices[0].message.content.strip().lower().startswith("yes"):
+                                    kw_found = True
+                            except Exception:
+                                kw_found = True
+                        if not kw_found:
+                            all_matched = False
+                            break
+                    if all_matched:
+                        matched.append(r["applicant_id"])
+                    prog_kw.progress((i + 1) / len(results))
+                prog_kw.empty()
+                st.session_state["kw_rank_active"] = kw_input.strip()
+                st.session_state["kw_rank_matched"] = matched
+                st.rerun()
 
-        # Metrics row
-        name = task_input.get("applicant_name") or task_input.get("candidate_name", "—")
-        agent_out = final_state.get("agent_output") or {}
-        conf = agent_out.get("confidence_score")
+            display_results = results
+            if st.session_state.get("kw_rank_active"):
+                matched_set = set(st.session_state["kw_rank_matched"])
+                display_results = [r for r in results if r["applicant_id"] in matched_set]
+                active_kws = st.session_state["kw_rank_active"]
+                kw_label = " · ".join(f'**"{k.strip()}"**' for k in active_kws.split(",") if k.strip())
+                st.info(f"🔍 Keywords: {kw_label} — {len(display_results)} of {len(results)} profile(s) matched.")
+                if not display_results:
+                    st.warning("No profiles matched. Try different keywords or click **✕ Clear**.")
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Candidate", name)
-        c2.metric("Job", task_input.get("job_title", "—"))
-        if conf is not None:
-            c3.metric("AI Confidence", f"{conf:.0%}")
-
-        st.divider()
-
-        # Verdict
-        st.markdown(verdict_badge(final_state), unsafe_allow_html=True)
-        st.divider()
-
-        # Result
-        st.markdown(final_state.get("final_result", "_(no result)_"))
-
-        manager = final_state.get("manager_decision") or {}
-        if manager.get("feedback"):
-            with st.expander("Manager Feedback"):
-                st.write(manager["feedback"])
-
-        st.divider()
-        st.subheader("Audit Trail")
-        render_audit(final_state.get("history", []))
-
-        if action == "Screen Resume":
             st.divider()
-            st.subheader("Resume")
-            raw = task_input.get("resume_text", "")
-            if raw:
-                with st.spinner("Formatting resume..."):
-                    st.markdown(format_resume(raw))
+
+            for rank, r in enumerate(display_results, 1):
+                fs = r["final_state"]
+                conf = r["confidence"]
+                error = r.get("error")
+
+                with st.container():
+                    col_rank, col_info, col_conf, col_badge = st.columns([0.5, 3, 2, 2])
+                    col_rank.markdown(f'<div class="rank-number">#{rank}</div>', unsafe_allow_html=True)
+                    ft_url = f"https://gonoise.freshteam.com/hire/jobs/{job_id}/applicants/listview/{r['applicant_id']}"
+                    col_info.markdown(
+                        f"**{r['name']}**  \nID: `{r['applicant_id']}` &nbsp; "
+                        f'<a href="{ft_url}" target="_blank" style="text-decoration:none;">'
+                        f'<button style="padding:2px 10px;font-size:12px;border-radius:5px;border:1px solid #ccc;'
+                        f'background:#f0f2f6;cursor:pointer;">🔗 Freshteam Profile</button></a>',
+                        unsafe_allow_html=True,
+                    )
+                    if error:
+                        col_conf.caption("Error")
+                        col_badge.markdown('<span class="verdict-escalated">⚠️ Error</span>', unsafe_allow_html=True)
+                    else:
+                        col_conf.progress(max(conf, 0), text=f"{conf:.0%} fit")
+                        col_badge.markdown(verdict_badge(fs), unsafe_allow_html=True)
+
+                    with st.expander("View full result"):
+                        if error:
+                            st.error(error)
+                        else:
+                            res_tab, result_tab, audit_tab = st.tabs(["📄 Resume", "🤖 AI Result", "🕵️ Audit"])
+                            with res_tab:
+                                raw = r["task_input"].get("resume_text", "")
+                                if raw:
+                                    with st.spinner("Formatting resume..."):
+                                        st.markdown(format_resume(raw))
+                                else:
+                                    st.caption("No resume file attached.")
+                            with result_tab:
+                                st.markdown(fs.get("final_result", "_(no result)_"))
+                            with audit_tab:
+                                render_audit(fs.get("history", []))
+
+                    st.divider()
+
+    # ── Sub-tab 2: Single Applicant ───────────────────────────────────────────
+    with tab_single:
+        st.subheader("Single Applicant")
+
+        app_map = {applicant_label(a): a["id"] for a in applicants}
+        selected_label = st.selectbox("Applicant", list(app_map.keys()))
+        applicant_id = app_map[selected_label]
+
+        action = st.radio("Action", ["Screen Resume", "Schedule Interview"], horizontal=True)
+
+        if action == "Schedule Interview":
+            import datetime
+            if "slot_count" not in st.session_state:
+                st.session_state.slot_count = 1
+
+            slots = []
+            for si in range(st.session_state.slot_count):
+                c_date, c_time, c_del = st.columns([3, 2, 0.5])
+                default_date = datetime.date.today() + datetime.timedelta(days=6 + si)
+                d = c_date.date_input(f"Slot {si+1} — Date", value=default_date, key=f"slot_date_{si}")
+                t = c_time.time_input(f"Slot {si+1} — Time (IST)", value=datetime.time(10, 0), key=f"slot_time_{si}", step=900)
+                slot_iso = f"{d.strftime('%Y-%m-%d')}T{t.strftime('%H:%M')}+05:30"
+                slots.append(slot_iso)
+                if st.session_state.slot_count > 1:
+                    if c_del.button("✕", key=f"del_slot_{si}", help="Remove slot"):
+                        st.session_state.slot_count -= 1
+                        st.rerun()
+
+            if st.session_state.slot_count < 5:
+                if st.button("＋ Add slot", key="add_slot"):
+                    st.session_state.slot_count += 1
+                    st.rerun()
+
+        if st.button("Run Agent", type="primary", key="single_run"):
+            with st.spinner("Running..."):
+                if action == "Screen Resume":
+                    final_state, task_input = run_screening(job_id, applicant_id)
+                else:
+                    final_state, task_input = run_scheduling(job_id, applicant_id, slots)
+
+            name = task_input.get("applicant_name") or task_input.get("candidate_name", "—")
+            agent_out = final_state.get("agent_output") or {}
+            conf = agent_out.get("confidence_score")
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Candidate", name)
+            c2.metric("Job", task_input.get("job_title", "—"))
+            if conf is not None:
+                c3.metric("AI Confidence", f"{conf:.0%}")
+
+            st.divider()
+            st.markdown(verdict_badge(final_state), unsafe_allow_html=True)
+            st.divider()
+            st.markdown(final_state.get("final_result", "_(no result)_"))
+
+            manager = final_state.get("manager_decision") or {}
+            if manager.get("feedback"):
+                with st.expander("Manager Feedback"):
+                    st.write(manager["feedback"])
+
+            st.divider()
+            st.subheader("Audit Trail")
+            render_audit(final_state.get("history", []))
+
+            if action == "Screen Resume":
+                st.divider()
+                st.subheader("Resume")
+                raw = task_input.get("resume_text", "")
+                if raw:
+                    with st.spinner("Formatting resume..."):
+                        st.markdown(format_resume(raw))
+                else:
+                    st.caption("No resume file attached.")
+
+    # ── Sub-tab 3: LinkedIn Sourcing ──────────────────────────────────────────
+    with tab_linkedin:
+        st.subheader("LinkedIn Profile Sourcing")
+        st.caption("Describe the role → AI builds a JD → AI extracts search params → Apify scrapes LinkedIn profiles.")
+
+        APIFY_TOKEN = os.environ.get("APIFY_API_TOKEN", "")
+        APIFY_ACTOR = "M2FMdjRVeF1HPGFcc"
+
+        # Read prefilled values from Requisition Form (if submitted)
+        _rq_title  = st.session_state.get("rq_title", "")
+        _rq_spec   = st.session_state.get("rq_spec", "")
+        _rq_exp    = st.session_state.get("rq_exp", "")
+        _rq_notice = st.session_state.get("rq_notice", "")
+        _rq_max    = int(st.session_state.get("rq_max", 20))
+
+        if _rq_title:
+            st.info("Fields pre-filled from the Requisition Form. Edit if needed, then click Source.")
+
+        with st.form("linkedin_sourcing_form"):
+            col1, col2 = st.columns(2)
+            li_title  = col1.text_input("Job Title", value=_rq_title, placeholder="e.g. Senior iOS Developer")
+            li_spec   = col1.text_input("Specialisation", value=_rq_spec, placeholder="e.g. Swift, SwiftUI, UIKit")
+            li_exp    = col2.text_input("Work Experience", value=_rq_exp, placeholder="e.g. 3-5 years")
+            li_notice = col2.text_input("Notice Period", value=_rq_notice, placeholder="e.g. Immediate / 30 days")
+            li_max    = col2.number_input("Max Profiles to Fetch", min_value=5, max_value=100, value=_rq_max, step=5)
+            submitted = st.form_submit_button("🚀 Source LinkedIn Profiles", type="primary")
+
+        if submitted and li_title.strip():
+            oai = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+            with st.spinner("Step 1/3 — Generating job description..."):
+                jd_resp = oai.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are an HR professional creating a concise and professional job description.\n"
+                                "Create a structured job description with: Job Title, Job Summary (2-3 lines), "
+                                "Key Responsibilities (5-7 bullets), Required Skills & Qualifications (5-6 bullets), "
+                                "Experience Required, Location, Notice Period Preference.\n"
+                                "Keep the tone professional. Location is Delhi NCR."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Job Title: {li_title}\nSpecialisation: {li_spec}\n"
+                                f"Work Experience Required: {li_exp}\nNotice Period Preference: {li_notice}"
+                            ),
+                        },
+                    ],
+                )
+                job_description = jd_resp.choices[0].message.content.strip()
+
+            with st.expander("Generated Job Description", expanded=False):
+                st.markdown(job_description)
+
+            with st.spinner("Step 2/3 — Extracting LinkedIn search parameters..."):
+                params_resp = oai.chat.completions.create(
+                    model="gpt-4o-mini",
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Extract LinkedIn search parameters from the job description and return valid JSON with these exact keys:\n"
+                                "- currentJobTitles: list of 3-5 relevant job title variants\n"
+                                "- locations: [\"Delhi, India\", \"Noida, India\", \"Gurgaon, India\", \"Faridabad, India\", \"Ghaziabad, India\"]\n"
+                                "- searchQuery: concise keyword string for LinkedIn search\n"
+                                "- functionIds: [\"8\"]\n"
+                                "- seniorityLevelIds: [\"120\"]\n"
+                                "- yearsOfExperienceIds: [\"3\"]\n"
+                                "- autoQuerySegmentation: false\n"
+                                "- recentlyChangedJobs: false\n"
+                                "- profileScraperMode: \"Full + email search\"\n"
+                                "- maxItems: 20"
+                            ),
+                        },
+                        {"role": "user", "content": job_description},
+                    ],
+                )
+                apify_params = json.loads(params_resp.choices[0].message.content)
+                apify_params["maxItems"] = int(li_max)
+
+            with st.expander("Apify Search Parameters", expanded=False):
+                st.json(apify_params)
+
+            with st.spinner(f"Step 3/3 — Scraping LinkedIn profiles (up to {int(li_max)}, may take ~2 min)..."):
+                try:
+                    apify_resp = _requests.post(
+                        f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items",
+                        headers={
+                            "Accept": "application/json",
+                            "Authorization": f"Bearer {APIFY_TOKEN}",
+                        },
+                        json=apify_params,
+                        timeout=180,
+                    )
+                    apify_resp.raise_for_status()
+                    profiles = apify_resp.json()
+                except Exception as e:
+                    st.error(f"Apify request failed: {e}")
+                    profiles = []
+
+            if not profiles:
+                st.warning("No profiles returned. Try adjusting the job title or specialisation.")
             else:
-                st.caption("No resume file attached.")
+                st.success(f"{len(profiles)} LinkedIn profile(s) found.")
+                st.divider()
+
+                for idx, p in enumerate(profiles, 1):
+                    name = f"{p.get('firstName', '')} {p.get('lastName', '')}".strip() or "—"
+                    headline = p.get("headline", "—")
+                    loc_raw = p.get("location")
+                    if isinstance(loc_raw, dict):
+                        location = loc_raw.get("parsed", {}).get("text", "—")
+                    else:
+                        location = loc_raw or "—"
+                    emails = p.get("emails") or []
+                    email = emails[0].get("email", "—") if emails and isinstance(emails[0], dict) else "—"
+                    skills = ", ".join(p.get("topSkills") or []) or "—"
+                    open_to_work = "  ✅ Open to Work" if p.get("openToWork") else ""
+                    linkedin_url = p.get("linkedinUrl", "")
+
+                    with st.container():
+                        c_num, c_info, c_meta = st.columns([0.5, 3, 2.5])
+                        c_num.markdown(f'<div class="rank-number">#{idx}</div>', unsafe_allow_html=True)
+                        btn_html = ""
+                        if linkedin_url:
+                            btn_html = (
+                                f'  \n<a href="{linkedin_url}" target="_blank" style="text-decoration:none;">'
+                                f'<button style="padding:2px 10px;font-size:12px;border-radius:5px;'
+                                f'border:1px solid #ccc;background:#f0f2f6;cursor:pointer;">🔗 LinkedIn Profile</button></a>'
+                            )
+                        c_info.markdown(
+                            f"**{name}**{open_to_work}  \n{headline}{btn_html}",
+                            unsafe_allow_html=True,
+                        )
+                        c_meta.caption(f"📍 {location}")
+                        c_meta.caption(f"📧 {email}")
+                        if skills != "—":
+                            c_meta.caption(f"🛠 {skills}")
+                        st.divider()
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TAB 3 — LinkedIn Sourcing via Apify
+# MAIN TAB 2 — Requisition Form
 # ════════════════════════════════════════════════════════════════════════════════
-with tab_linkedin:
-    import json, requests as _requests
+with main_tab_requisition:
+    st.subheader("Requisition Form")
+    st.caption("Describe the role in plain English — AI will extract the details and pre-fill the LinkedIn Sourcing form.")
 
-    st.subheader("LinkedIn Profile Sourcing")
-    st.caption("Describe the role → AI builds a JD → AI extracts search params → Apify scrapes LinkedIn profiles.")
+    with st.form("requisition_form"):
+        rq_prompt = st.text_area(
+            "Describe the role",
+            placeholder=(
+                "e.g. I want to hire a Senior iOS Developer with 5+ years of experience in Swift and SwiftUI, "
+                "who can join within 30 days. Source around 20 profiles from Delhi NCR."
+            ),
+            height=120,
+        )
+        rq_submit = st.form_submit_button("Analyse & Pre-fill LinkedIn Sourcing", type="primary")
 
-    APIFY_TOKEN = os.environ.get("APIFY_API_TOKEN", "")
-    APIFY_ACTOR = "M2FMdjRVeF1HPGFcc"
-
-    with st.form("linkedin_sourcing_form"):
-        col1, col2 = st.columns(2)
-        li_title = col1.text_input("Job Title", placeholder="e.g. Senior iOS Developer")
-        li_spec = col1.text_input("Specialisation", placeholder="e.g. Swift, SwiftUI, UIKit")
-        li_exp = col2.text_input("Work Experience", placeholder="e.g. 3-5 years")
-        li_notice = col2.text_input("Notice Period", placeholder="e.g. Immediate / 30 days")
-        li_max = col2.number_input("Max Profiles to Fetch", min_value=5, max_value=100, value=20, step=5)
-        submitted = st.form_submit_button("🚀 Source LinkedIn Profiles", type="primary")
-
-    if submitted and li_title.strip():
-        oai = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-
-        # Step 1: Generate Job Description
-        with st.spinner("Step 1/3 — Generating job description..."):
-            jd_resp = oai.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are an HR professional creating a concise and professional job description.\n"
-                            "Create a structured job description with: Job Title, Job Summary (2-3 lines), "
-                            "Key Responsibilities (5-7 bullets), Required Skills & Qualifications (5-6 bullets), "
-                            "Experience Required, Location, Notice Period Preference.\n"
-                            "Keep the tone professional. Location is Delhi NCR."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Job Title: {li_title}\nSpecialisation: {li_spec}\n"
-                            f"Work Experience Required: {li_exp}\nNotice Period Preference: {li_notice}"
-                        ),
-                    },
-                ],
-            )
-            job_description = jd_resp.choices[0].message.content.strip()
-
-        with st.expander("Generated Job Description", expanded=False):
-            st.markdown(job_description)
-
-        # Step 2: Extract Apify search params from JD
-        with st.spinner("Step 2/3 — Extracting LinkedIn search parameters..."):
-            params_resp = oai.chat.completions.create(
+    if rq_submit and rq_prompt.strip():
+        with st.spinner("Analysing your prompt..."):
+            oai_rq = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+            rq_resp = oai_rq.chat.completions.create(
                 model="gpt-4o-mini",
                 response_format={"type": "json_object"},
                 messages=[
                     {
                         "role": "system",
                         "content": (
-                            "Extract LinkedIn search parameters from the job description and return valid JSON with these exact keys:\n"
-                            "- currentJobTitles: list of 3-5 relevant job title variants\n"
-                            "- locations: [\"Delhi, India\", \"Noida, India\", \"Gurgaon, India\", \"Faridabad, India\", \"Ghaziabad, India\"]\n"
-                            "- searchQuery: concise keyword string for LinkedIn search\n"
-                            "- functionIds: [\"8\"]\n"
-                            "- seniorityLevelIds: [\"120\"]\n"
-                            "- yearsOfExperienceIds: [\"3\"]\n"
-                            "- autoQuerySegmentation: false\n"
-                            "- recentlyChangedJobs: false\n"
-                            "- profileScraperMode: \"Full + email search\"\n"
-                            "- maxItems: 20"
+                            "You are an HR assistant. Extract hiring details from the user's prompt and return JSON with exactly these keys:\n"
+                            "- job_title: string (the role being hired for)\n"
+                            "- specialisation: string (tech stack, domain, or skills focus)\n"
+                            "- work_experience: string (years of experience required, e.g. '5+ years')\n"
+                            "- notice_period: string (joining timeline preference, e.g. 'Immediate' or '30 days')\n"
+                            "- max_profiles: integer (number of LinkedIn profiles to source, default 20)\n"
+                            "If a detail is not mentioned, use a sensible default."
                         ),
                     },
-                    {"role": "user", "content": job_description},
+                    {"role": "user", "content": rq_prompt.strip()},
                 ],
             )
-            apify_params = json.loads(params_resp.choices[0].message.content)
-            apify_params["maxItems"] = int(li_max)
+            extracted = json.loads(rq_resp.choices[0].message.content)
 
-        with st.expander("Apify Search Parameters", expanded=False):
-            st.json(apify_params)
+        st.session_state["rq_title"]  = extracted.get("job_title", "")
+        st.session_state["rq_spec"]   = extracted.get("specialisation", "")
+        st.session_state["rq_exp"]    = extracted.get("work_experience", "")
+        st.session_state["rq_notice"] = extracted.get("notice_period", "")
+        st.session_state["rq_max"]    = int(extracted.get("max_profiles", 20))
 
-        # Step 3: Call Apify LinkedIn scraper
-        with st.spinner(f"Step 3/3 — Scraping LinkedIn profiles (up to {int(li_max)}, may take ~2 min)..."):
-            try:
-                apify_resp = _requests.post(
-                    f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items",
-                    headers={
-                        "Accept": "application/json",
-                        "Authorization": f"Bearer {APIFY_TOKEN}",
-                    },
-                    json=apify_params,
-                    timeout=180,
-                )
-                apify_resp.raise_for_status()
-                profiles = apify_resp.json()
-            except Exception as e:
-                st.error(f"Apify request failed: {e}")
-                profiles = []
-
-        if not profiles:
-            st.warning("No profiles returned. Try adjusting the job title or specialisation.")
-        else:
-            st.success(f"{len(profiles)} LinkedIn profile(s) found.")
-            st.divider()
-
-            for idx, p in enumerate(profiles, 1):
-                name = f"{p.get('firstName', '')} {p.get('lastName', '')}".strip() or "—"
-                headline = p.get("headline", "—")
-                loc_raw = p.get("location")
-                if isinstance(loc_raw, dict):
-                    location = loc_raw.get("parsed", {}).get("text", "—")
-                else:
-                    location = loc_raw or "—"
-                emails = p.get("emails") or []
-                email = emails[0].get("email", "—") if emails and isinstance(emails[0], dict) else "—"
-                skills = ", ".join(p.get("topSkills") or []) or "—"
-                open_to_work = "  ✅ Open to Work" if p.get("openToWork") else ""
-                linkedin_url = p.get("linkedinUrl", "")
-
-                with st.container():
-                    c_num, c_info, c_meta = st.columns([0.5, 3, 2.5])
-                    c_num.markdown(f'<div class="rank-number">#{idx}</div>', unsafe_allow_html=True)
-
-                    btn_html = ""
-                    if linkedin_url:
-                        btn_html = (
-                            f'  \n<a href="{linkedin_url}" target="_blank" style="text-decoration:none;">'
-                            f'<button style="padding:2px 10px;font-size:12px;border-radius:5px;'
-                            f'border:1px solid #ccc;background:#f0f2f6;cursor:pointer;">🔗 LinkedIn Profile</button></a>'
-                        )
-                    c_info.markdown(
-                        f"**{name}**{open_to_work}  \n{headline}{btn_html}",
-                        unsafe_allow_html=True,
-                    )
-                    c_meta.caption(f"📍 {location}")
-                    c_meta.caption(f"📧 {email}")
-                    if skills != "—":
-                        c_meta.caption(f"🛠 {skills}")
-
-                    st.divider()
+        st.success("Done! Fields extracted and saved.")
+        st.markdown("**Extracted details:**")
+        col_a, col_b = st.columns(2)
+        col_a.markdown(f"- **Job Title:** {st.session_state['rq_title']}")
+        col_a.markdown(f"- **Specialisation:** {st.session_state['rq_spec']}")
+        col_a.markdown(f"- **Work Experience:** {st.session_state['rq_exp']}")
+        col_b.markdown(f"- **Notice Period:** {st.session_state['rq_notice']}")
+        col_b.markdown(f"- **Max Profiles:** {st.session_state['rq_max']}")
+        st.info("Switch to **Resume Screening → LinkedIn Sourcing** tab — the form is pre-filled and ready to run.")
