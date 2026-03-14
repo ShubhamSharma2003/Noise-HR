@@ -75,7 +75,7 @@ st.divider()
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
-@st.cache_data(show_spinner="Fetching jobs from Freshteam...")
+@st.cache_data(show_spinner="Fetching jobs from Freshteam...", ttl=60)
 def load_jobs():
     return FreshteamClient().get_job_postings()
 

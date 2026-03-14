@@ -54,11 +54,10 @@ class FreshteamClient:
 
     # ── Public methods ────────────────────────────────────────────────────────
 
-    def get_job_postings(self, status: str = "published") -> list[dict]:
+    def get_job_postings(self) -> list[dict]:
         """Return all job postings. Falls back to empty list if role lacks permission."""
-        params = {"status": status} if status else {}
         try:
-            return self._paginate("/job_postings", params)
+            return self._paginate("/job_postings")
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 403:
                 return []  # role can't list jobs — caller should use get_job_posting() instead
