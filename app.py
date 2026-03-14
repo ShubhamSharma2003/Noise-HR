@@ -190,6 +190,13 @@ with tab_rank:
     st.subheader("Rank All Applicants by Resume Fit")
     st.caption("Screens every applicant and sorts them best-to-worst by AI confidence score.")
 
+    ranked_key = f"ranked_results_{job_id}"
+
+    # Clear stored results if job changes
+    for k in list(st.session_state.keys()):
+        if k.startswith("ranked_results_") and k != ranked_key:
+            del st.session_state[k]
+
     if st.button("Screen & Rank All", type="primary", key="rank_all"):
         results = []
         progress = st.progress(0, text="Starting...")
@@ -224,13 +231,105 @@ with tab_rank:
         status_box.empty()
         progress.empty()
 
-        # Sort best → worst
         results.sort(key=lambda r: r["confidence"], reverse=True)
+        st.session_state[ranked_key] = results
+        st.rerun()
 
+    if ranked_key in st.session_state:
+        results = st.session_state[ranked_key]
         st.success(f"Done! Ranked {len(results)} applicants.")
+
+        # ── Keyword filter (operates on already-fetched resume text) ──────────
+        st.divider()
+        kw_col, btn_col, clear_col = st.columns([4, 1.2, 1])
+        kw_input = kw_col.text_input(
+            "kw_rank_label",
+            placeholder="Filter by keywords (comma-separated) — e.g. Chandigarh University, entrepreneur, AWS",
+            label_visibility="collapsed",
+            key="kw_rank_input",
+        )
+        apply_kw_rank = btn_col.button("🔍 Filter", key="apply_kw_rank")
+        clear_kw_rank = clear_col.button("✕ Clear", key="clear_kw_rank")
+
+        if clear_kw_rank:
+            st.session_state.pop("kw_rank_active", None)
+            st.session_state.pop("kw_rank_matched", None)
+            st.rerun()
+
+        if apply_kw_rank and kw_input.strip():
+            # ALL keywords must match (AND logic) — profile included only if every keyword is found
+            keywords = [k.strip() for k in kw_input.split(",") if k.strip()]
+            matched = []
+            oai_kw = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+            prog_kw = st.progress(0, text="Filtering...")
+            for i, r in enumerate(results):
+                resume_text = r.get("task_input", {}).get("resume_text", "") or r.get("name", "")
+                # Normalize whitespace so multi-word phrases survive PDF line breaks
+                resume_normalized = " ".join(resume_text.split()).lower()
+                all_matched = True
+                for kw in keywords:
+                    kw_lower = kw.lower()
+                    kw_found = False
+                    # Fast path: literal match
+                    if kw_lower in resume_normalized:
+                        kw_found = True
+                    else:
+                        # Semantic fallback via AI
+                        try:
+                            resp = oai_kw.chat.completions.create(
+                                model="gpt-4o-mini",
+                                max_tokens=10,
+                                messages=[
+                                    {
+                                        "role": "system",
+                                        "content": (
+                                            "You are a smart candidate filter. Given a keyword/phrase and a resume, "
+                                            "reply ONLY 'yes' or 'no': does this resume match the keyword concept?\n"
+                                            "Be semantically intelligent:\n"
+                                            "- 'entrepreneur' → co-founded, startup founder, own business\n"
+                                            "- 'tier 1 college' → IIT, IIM, IISc, NIT, top-ranked university\n"
+                                            "- 'fintech' → payments, banking tech, neo-bank, lending\n"
+                                            "Match intent, not just exact words."
+                                        ),
+                                    },
+                                    {
+                                        "role": "user",
+                                        "content": f"Keyword: {kw}\n\nResume:\n{resume_text[:3000]}",
+                                    },
+                                ],
+                            )
+                            if resp.choices[0].message.content.strip().lower().startswith("yes"):
+                                kw_found = True
+                        except Exception:
+                            kw_found = True
+                    if not kw_found:
+                        all_matched = False
+                        break
+                if all_matched:
+                    matched.append(r["applicant_id"])
+                prog_kw.progress((i + 1) / len(results))
+            prog_kw.empty()
+            st.session_state["kw_rank_active"] = kw_input.strip()
+            st.session_state["kw_rank_matched"] = matched
+            st.rerun()
+
+        # Apply active filter to display list
+        display_results = results
+        if st.session_state.get("kw_rank_active"):
+            matched_set = set(st.session_state["kw_rank_matched"])
+            display_results = [r for r in results if r["applicant_id"] in matched_set]
+            active_kws = st.session_state["kw_rank_active"]
+            kw_label = " · ".join(f'**"{k.strip()}"**' for k in active_kws.split(",") if k.strip())
+            st.info(
+                f"🔍 Keywords: {kw_label} "
+                f"— {len(display_results)} of {len(results)} profile(s) matched."
+            )
+            if not display_results:
+                st.warning("No profiles matched. Try different keywords or click **✕ Clear**.")
+
         st.divider()
 
-        for rank, r in enumerate(results, 1):
+        for rank, r in enumerate(display_results, 1):
             fs = r["final_state"]
             conf = r["confidence"]
             error = r.get("error")

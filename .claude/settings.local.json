@@ -16,7 +16,11 @@
       "Bash(python run.py --screen 2000073751 2005027008)",
       "Bash(python -c \":*)",
       "Bash(python run.py --screen 2000073751 2005027411)",
-      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8501)"
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8501)",
+      "Bash(pkill -f \"streamlit run\")",
+      "Bash(streamlit run:*)",
+      "Bash(python -m streamlit --version)",
+      "Bash(python3 -m streamlit --version)"
     ]
   }
 }
