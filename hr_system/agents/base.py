@@ -6,8 +6,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+_client = None
 MODEL = "gpt-4o"
+
+
+def _get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        _client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    return _client
 
 
 def call_llm(system_prompt: str, user_prompt: str, expect_json: bool = True) -> dict | str:
@@ -19,7 +26,7 @@ def call_llm(system_prompt: str, user_prompt: str, expect_json: bool = True) -> 
     if expect_json:
         kwargs["response_format"] = {"type": "json_object"}
 
-    response = _client.chat.completions.create(
+    response = _get_client().chat.completions.create(
         model=MODEL,
         max_tokens=2048,
         messages=[

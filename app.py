@@ -8,14 +8,12 @@ from openai import OpenAI
 from hr_system.freshteam import FreshteamClient
 from hr_system.graph import hr_graph
 
-_openai = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-
 @st.cache_data(show_spinner=False)
 def format_resume(raw_text: str) -> str:
     """Use GPT-4o to parse raw resume text into clean structured markdown."""
     if not raw_text or len(raw_text.strip()) < 20:
         return "_No resume content available._"
-    response = _openai.chat.completions.create(
+    response = OpenAI(api_key=os.environ.get("OPENAI_API_KEY")).chat.completions.create(
         model="gpt-4o",
         max_tokens=1500,
         messages=[
