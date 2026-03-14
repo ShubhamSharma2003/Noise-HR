@@ -181,7 +181,7 @@ st.caption(f"{len(applicants)} applicant(s) found")
 st.divider()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_rank, tab_single = st.tabs(["📊 Rank All Applicants", "🔍 Single Applicant"])
+tab_rank, tab_single, tab_linkedin = st.tabs(["📊 Rank All Applicants", "🔍 Single Applicant", "🔗 LinkedIn Sourcing"])
 
 # ════════════════════════════════════════════════════════════════════════════════
 # TAB 1 — Rank All
@@ -453,3 +453,147 @@ with tab_single:
                     st.markdown(format_resume(raw))
             else:
                 st.caption("No resume file attached.")
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 3 — LinkedIn Sourcing via Apify
+# ════════════════════════════════════════════════════════════════════════════════
+with tab_linkedin:
+    import json, requests as _requests
+
+    st.subheader("LinkedIn Profile Sourcing")
+    st.caption("Describe the role → AI builds a JD → AI extracts search params → Apify scrapes LinkedIn profiles.")
+
+    APIFY_TOKEN = os.environ.get("APIFY_API_TOKEN", "")
+    APIFY_ACTOR = "M2FMdjRVeF1HPGFcc"
+
+    with st.form("linkedin_sourcing_form"):
+        col1, col2 = st.columns(2)
+        li_title = col1.text_input("Job Title", placeholder="e.g. Senior iOS Developer")
+        li_spec = col1.text_input("Specialisation", placeholder="e.g. Swift, SwiftUI, UIKit")
+        li_exp = col2.text_input("Work Experience", placeholder="e.g. 3-5 years")
+        li_notice = col2.text_input("Notice Period", placeholder="e.g. Immediate / 30 days")
+        li_max = col2.number_input("Max Profiles to Fetch", min_value=5, max_value=100, value=20, step=5)
+        submitted = st.form_submit_button("🚀 Source LinkedIn Profiles", type="primary")
+
+    if submitted and li_title.strip():
+        oai = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+        # Step 1: Generate Job Description
+        with st.spinner("Step 1/3 — Generating job description..."):
+            jd_resp = oai.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an HR professional creating a concise and professional job description.\n"
+                            "Create a structured job description with: Job Title, Job Summary (2-3 lines), "
+                            "Key Responsibilities (5-7 bullets), Required Skills & Qualifications (5-6 bullets), "
+                            "Experience Required, Location, Notice Period Preference.\n"
+                            "Keep the tone professional. Location is Delhi NCR."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Job Title: {li_title}\nSpecialisation: {li_spec}\n"
+                            f"Work Experience Required: {li_exp}\nNotice Period Preference: {li_notice}"
+                        ),
+                    },
+                ],
+            )
+            job_description = jd_resp.choices[0].message.content.strip()
+
+        with st.expander("Generated Job Description", expanded=False):
+            st.markdown(job_description)
+
+        # Step 2: Extract Apify search params from JD
+        with st.spinner("Step 2/3 — Extracting LinkedIn search parameters..."):
+            params_resp = oai.chat.completions.create(
+                model="gpt-4o-mini",
+                response_format={"type": "json_object"},
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Extract LinkedIn search parameters from the job description and return valid JSON with these exact keys:\n"
+                            "- currentJobTitles: list of 3-5 relevant job title variants\n"
+                            "- locations: [\"Delhi, India\", \"Noida, India\", \"Gurgaon, India\", \"Faridabad, India\", \"Ghaziabad, India\"]\n"
+                            "- searchQuery: concise keyword string for LinkedIn search\n"
+                            "- functionIds: [\"8\"]\n"
+                            "- seniorityLevelIds: [\"120\"]\n"
+                            "- yearsOfExperienceIds: [\"3\"]\n"
+                            "- autoQuerySegmentation: false\n"
+                            "- recentlyChangedJobs: false\n"
+                            "- profileScraperMode: \"Full + email search\"\n"
+                            "- maxItems: 20"
+                        ),
+                    },
+                    {"role": "user", "content": job_description},
+                ],
+            )
+            apify_params = json.loads(params_resp.choices[0].message.content)
+            apify_params["maxItems"] = int(li_max)
+
+        with st.expander("Apify Search Parameters", expanded=False):
+            st.json(apify_params)
+
+        # Step 3: Call Apify LinkedIn scraper
+        with st.spinner(f"Step 3/3 — Scraping LinkedIn profiles (up to {int(li_max)}, may take ~2 min)..."):
+            try:
+                apify_resp = _requests.post(
+                    f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items",
+                    headers={
+                        "Accept": "application/json",
+                        "Authorization": f"Bearer {APIFY_TOKEN}",
+                    },
+                    json=apify_params,
+                    timeout=180,
+                )
+                apify_resp.raise_for_status()
+                profiles = apify_resp.json()
+            except Exception as e:
+                st.error(f"Apify request failed: {e}")
+                profiles = []
+
+        if not profiles:
+            st.warning("No profiles returned. Try adjusting the job title or specialisation.")
+        else:
+            st.success(f"{len(profiles)} LinkedIn profile(s) found.")
+            st.divider()
+
+            for idx, p in enumerate(profiles, 1):
+                name = f"{p.get('firstName', '')} {p.get('lastName', '')}".strip() or "—"
+                headline = p.get("headline", "—")
+                loc_raw = p.get("location")
+                if isinstance(loc_raw, dict):
+                    location = loc_raw.get("parsed", {}).get("text", "—")
+                else:
+                    location = loc_raw or "—"
+                emails = p.get("emails") or []
+                email = emails[0].get("email", "—") if emails and isinstance(emails[0], dict) else "—"
+                skills = ", ".join(p.get("topSkills") or []) or "—"
+                open_to_work = "  ✅ Open to Work" if p.get("openToWork") else ""
+                linkedin_url = p.get("linkedinUrl", "")
+
+                with st.container():
+                    c_num, c_info, c_meta = st.columns([0.5, 3, 2.5])
+                    c_num.markdown(f'<div class="rank-number">#{idx}</div>', unsafe_allow_html=True)
+
+                    btn_html = ""
+                    if linkedin_url:
+                        btn_html = (
+                            f'  \n<a href="{linkedin_url}" target="_blank" style="text-decoration:none;">'
+                            f'<button style="padding:2px 10px;font-size:12px;border-radius:5px;'
+                            f'border:1px solid #ccc;background:#f0f2f6;cursor:pointer;">🔗 LinkedIn Profile</button></a>'
+                        )
+                    c_info.markdown(
+                        f"**{name}**{open_to_work}  \n{headline}{btn_html}",
+                        unsafe_allow_html=True,
+                    )
+                    c_meta.caption(f"📍 {location}")
+                    c_meta.caption(f"📧 {email}")
+                    if skills != "—":
+                        c_meta.caption(f"🛠 {skills}")
+
+                    st.divider()

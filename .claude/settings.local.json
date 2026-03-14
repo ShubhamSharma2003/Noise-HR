@@ -20,7 +20,9 @@
       "Bash(pkill -f \"streamlit run\")",
       "Bash(streamlit run:*)",
       "Bash(python -m streamlit --version)",
-      "Bash(python3 -m streamlit --version)"
+      "Bash(python3 -m streamlit --version)",
+      "Bash(\"d:/Desktop/HR/app.py\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''d:/Desktop/HR/app.py''\\).read\\(\\)\\); print\\(''syntax OK''\\)\")"
     ]
   }
 }
