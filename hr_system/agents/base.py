@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 MODEL = "gpt-4o"
 
 
