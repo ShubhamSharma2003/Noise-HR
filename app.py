@@ -8,7 +8,7 @@ from openai import OpenAI
 from hr_system.freshteam import FreshteamClient
 from hr_system.graph import hr_graph
 
-_openai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+_openai = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 @st.cache_data(show_spinner=False)
 def format_resume(raw_text: str) -> str:
