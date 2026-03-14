@@ -338,7 +338,14 @@ with tab_rank:
                 col_rank, col_info, col_conf, col_badge = st.columns([0.5, 3, 2, 2])
 
                 col_rank.markdown(f'<div class="rank-number">#{rank}</div>', unsafe_allow_html=True)
-                col_info.markdown(f"**{r['name']}**  \nID: `{r['applicant_id']}`")
+                ft_url = f"https://gonoise.freshteam.com/hire/jobs/{job_id}/applicants/listview/{r['applicant_id']}"
+                col_info.markdown(
+                    f"**{r['name']}**  \nID: `{r['applicant_id']}` &nbsp; "
+                    f'<a href="{ft_url}" target="_blank" style="text-decoration:none;">'
+                    f'<button style="padding:2px 10px;font-size:12px;border-radius:5px;border:1px solid #ccc;'
+                    f'background:#f0f2f6;cursor:pointer;">🔗 Freshteam Profile</button></a>',
+                    unsafe_allow_html=True,
+                )
 
                 if error:
                     col_conf.caption("Error")
