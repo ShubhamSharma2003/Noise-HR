@@ -7,6 +7,7 @@ import json
 import requests as _requests
 import streamlit as st
 from openai import OpenAI
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from hr_system.freshteam import FreshteamClient
 from hr_system.graph import hr_graph
 
@@ -417,19 +418,70 @@ with main_tab_screening:
                                 render_audit(fs.get("history", []))
                 st.divider()
 
+        # ── Pre-filter panel ──────────────────────────────────────────────────
+        is_scanning = st.session_state.get(scanning_key, False)
+
+        with st.expander("⚙️ Screening filters & settings", expanded=len(applicants) > 50):
+            # Stage filter
+            all_stages = sorted({
+                ((a.get("stage") or {}).get("name") if isinstance(a.get("stage"), dict) else a.get("stage")) or "Unknown"
+                for a in applicants
+            })
+            selected_stages = st.multiselect(
+                "Only screen applicants in these stages",
+                options=all_stages,
+                default=all_stages,
+                key="screen_stages",
+                disabled=is_scanning,
+            )
+
+            f_col1, f_col2 = st.columns(2)
+            max_to_screen = f_col1.number_input(
+                "Max profiles to screen",
+                min_value=1,
+                max_value=len(applicants),
+                value=min(50, len(applicants)),
+                step=10,
+                key="screen_max",
+                disabled=is_scanning,
+                help="Caps the number of AI screening calls. Use with stage filter to target the right pool first.",
+            )
+            workers = f_col2.slider(
+                "Parallel workers",
+                min_value=1, max_value=5, value=3,
+                key="screen_workers",
+                disabled=is_scanning,
+                help="How many profiles to screen simultaneously. Higher = faster but more API load.",
+            )
+
+            # Build the filtered list and show a preview
+            pre_filtered = [
+                a for a in applicants
+                if (((a.get("stage") or {}).get("name") if isinstance(a.get("stage"), dict)
+                     else a.get("stage")) or "Unknown") in selected_stages
+            ][:int(max_to_screen)]
+            st.caption(
+                f"**{len(pre_filtered)}** of **{len(applicants)}** applicants will be screened "
+                f"({workers} at a time)."
+            )
+
+        # Store filtered queue in session state when scan starts
+        scan_queue_key = f"scan_queue_{job_id}"
+
         # ── Button row ────────────────────────────────────────────────────────
         btn_col, stop_col = st.columns([2, 1])
         if btn_col.button("Screen & Rank All", type="primary", key="rank_all",
-                          disabled=st.session_state.get(scanning_key, False)):
-            st.session_state[scanning_key] = True
-            st.session_state[scan_buf_key] = []
+                          disabled=is_scanning):
+            st.session_state[scanning_key]  = True
+            st.session_state[scan_buf_key]  = []
+            st.session_state[scan_queue_key] = pre_filtered   # snapshot the filtered list
             st.session_state.pop(ranked_key, None)
             st.session_state.pop("kw_rank_active", None)
             st.session_state.pop("kw_rank_matched", None)
             st.rerun()
 
         if stop_col.button("⏹ Stop", key="rank_stop",
-                           disabled=not st.session_state.get(scanning_key, False)):
+                           disabled=not is_scanning):
             st.session_state[scanning_key] = False
             scanned = st.session_state.get(scan_buf_key, [])
             if scanned:
@@ -437,44 +489,50 @@ with main_tab_screening:
                 st.session_state[ranked_key] = scanned
             st.rerun()
 
-        # ── Live scanning: one profile per rerun ──────────────────────────────
+        # ── Live scanning: one batch per rerun ────────────────────────────────
         if st.session_state.get(scanning_key, False):
-            scanned = st.session_state[scan_buf_key]
-            idx = len(scanned)
-            total = len(applicants)
+            scanned  = st.session_state[scan_buf_key]
+            queue    = st.session_state[scan_queue_key]
+            total    = len(queue)
+            done     = len(scanned)
+            w        = st.session_state.get("screen_workers", 3)
 
-            st.progress(idx / total, text=f"Scanning {idx}/{total}…")
+            st.progress(done / total, text=f"Screened {done}/{total}…")
 
-            # Render already-scanned cards (live mode — no expander yet)
+            # Render already-scanned cards (live — no expander)
             for i, r in enumerate(scanned, 1):
                 _render_rank_card(r, i, live=True)
 
-            if idx < total:
-                app  = applicants[idx]
-                name = applicant_label(app)
-                aid  = app["id"]
-                with st.spinner(f"Scanning **{name}** ({idx+1}/{total})…"):
-                    try:
-                        final_state, task_input = run_screening(job_id, aid)
-                        agent_out  = final_state.get("agent_output") or {}
-                        confidence = agent_out.get("confidence_score", 0.0)
-                        scanned.append({
-                            "name": name, "applicant_id": aid,
-                            "confidence": confidence,
-                            "final_state": final_state, "task_input": task_input,
-                        })
-                    except Exception as e:
-                        scanned.append({
-                            "name": name, "applicant_id": aid,
-                            "confidence": -1, "error": str(e),
-                            "final_state": {}, "task_input": {},
-                        })
+            if done < total:
+                batch_apps = queue[done:done + w]
+                names = ", ".join(applicant_label(a) for a in batch_apps)
+                with st.spinner(f"Scanning {done+1}–{min(done+w, total)}/{total}: {names}…"):
+                    batch_results = []
+
+                    def _screen_one(app):
+                        name = applicant_label(app)
+                        aid  = app["id"]
+                        try:
+                            fs, ti = run_screening(job_id, aid)
+                            conf = (fs.get("agent_output") or {}).get("confidence_score", 0.0)
+                            return {"name": name, "applicant_id": aid, "confidence": conf,
+                                    "final_state": fs, "task_input": ti}
+                        except Exception as e:
+                            return {"name": name, "applicant_id": aid, "confidence": -1,
+                                    "error": str(e), "final_state": {}, "task_input": {}}
+
+                    with ThreadPoolExecutor(max_workers=w) as pool:
+                        futures = {pool.submit(_screen_one, a): a for a in batch_apps}
+                        for fut in as_completed(futures):
+                            batch_results.append(fut.result())
+
+                scanned.extend(batch_results)
                 st.session_state[scan_buf_key] = scanned
                 st.rerun()
             else:
                 # All done — sort and persist
                 scanned.sort(key=lambda r: r["confidence"], reverse=True)
-                st.session_state[ranked_key] = scanned
+                st.session_state[ranked_key]   = scanned
                 st.session_state[scanning_key] = False
                 st.rerun()
 
