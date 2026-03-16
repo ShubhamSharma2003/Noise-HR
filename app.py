@@ -509,9 +509,9 @@ with main_tab_screening:
                                 "- currentJobTitles: list of 3-5 relevant job title variants\n"
                                 "- locations: [\"Delhi, India\", \"Noida, India\", \"Gurgaon, India\", \"Faridabad, India\", \"Ghaziabad, India\"]\n"
                                 "- searchQuery: concise keyword string for LinkedIn search\n"
-                                "- functionIds: [\"8\"]\n"
-                                "- seniorityLevelIds: [\"120\"]\n"
-                                "- yearsOfExperienceIds: [\"3\"]\n"
+                                "- functionIds: pick 1-2 most relevant IDs (as strings) from: 1=Accounting, 2=Administrative, 3=Arts and Design, 4=Business Development, 6=Consulting, 7=Education, 8=Engineering, 10=Finance, 12=Human Resources, 13=Information Technology, 15=Marketing, 19=Product Management, 24=Research, 25=Sales\n"
+                                "- seniorityLevelIds: pick most relevant IDs (as strings) from: 100=In Training, 110=Entry Level, 120=Senior, 130=Strategic, 200=Entry Level Manager, 210=Experienced Manager, 220=Director, 300=Vice President\n"
+                                "- yearsOfExperienceIds: pick most relevant IDs (as strings) from: 1=Less than 1 year, 2=1 to 2 years, 3=3 to 5 years, 4=6 to 10 years, 5=More than 10 years\n"
                                 "- autoQuerySegmentation: false\n"
                                 "- recentlyChangedJobs: false\n"
                                 "- profileScraperMode: \"Full + email search\"\n"
@@ -536,10 +536,20 @@ with main_tab_screening:
                             "Authorization": f"Bearer {APIFY_TOKEN}",
                         },
                         json=apify_params,
-                        timeout=180,
+                        timeout=300,
                     )
+                    with st.expander("Apify Raw Response (debug)", expanded=False):
+                        st.write(f"Status code: {apify_resp.status_code}")
+                        try:
+                            raw_json = apify_resp.json()
+                            st.json(raw_json if isinstance(raw_json, dict) else {"items": raw_json[:2] if raw_json else []})
+                        except Exception:
+                            st.text(apify_resp.text[:2000])
                     apify_resp.raise_for_status()
                     profiles = apify_resp.json()
+                    # Handle case where response is wrapped in a dict
+                    if isinstance(profiles, dict):
+                        profiles = profiles.get("items", profiles.get("data", []))
                 except Exception as e:
                     st.error(f"Apify request failed: {e}")
                     profiles = []
