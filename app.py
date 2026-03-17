@@ -16,17 +16,37 @@ st.set_page_config(page_title="HR Agent System", page_icon="🧑‍💼", layout
 
 st.markdown("""
 <style>
-.verdict-approve {
+.verdict-perfect-fit {
+    background:#c3e6cb;color:#155724;
+    padding:6px 14px;border-radius:6px;
+    font-weight:bold;display:inline-block;
+}
+.verdict-strong-fit {
     background:#d4edda;color:#155724;
     padding:6px 14px;border-radius:6px;
     font-weight:bold;display:inline-block;
 }
-.verdict-reject {
+.verdict-good-fit {
+    background:#d1ecf1;color:#0c5460;
+    padding:6px 14px;border-radius:6px;
+    font-weight:bold;display:inline-block;
+}
+.verdict-moderate-fit {
+    background:#fff3cd;color:#856404;
+    padding:6px 14px;border-radius:6px;
+    font-weight:bold;display:inline-block;
+}
+.verdict-low-fit {
     background:#f8d7da;color:#721c24;
     padding:6px 14px;border-radius:6px;
     font-weight:bold;display:inline-block;
 }
-.verdict-escalated {
+.verdict-no-fit {
+    background:#d6d8d9;color:#1b1e21;
+    padding:6px 14px;border-radius:6px;
+    font-weight:bold;display:inline-block;
+}
+.verdict-pending {
     background:#fff3cd;color:#856404;
     padding:6px 14px;border-radius:6px;
     font-weight:bold;display:inline-block;
@@ -86,6 +106,10 @@ def load_jobs():
 def load_applicants(job_id):
     return FreshteamClient().get_applicants(job_id)
 
+@st.cache_data(show_spinner="Fetching job details...", ttl=60)
+def load_job_detail(job_id):
+    return FreshteamClient().get_job_posting(job_id)
+
 def applicant_label(a):
     c = a.get("candidate") or a
     name = f"{c.get('first_name','')} {c.get('last_name','')}".strip()
@@ -124,14 +148,43 @@ def run_scheduling(job_id, applicant_id, slots):
     return hr_graph.invoke(state), task_input
 
 def verdict_badge(final_state):
-    if final_state.get("escalated_to_cos"):
-        return '<span class="verdict-escalated">⚠️ Escalated</span>'
-    v = (final_state.get("manager_decision") or {}).get("verdict", "")
-    if v == "APPROVE":
-        return '<span class="verdict-approve">✅ Approved</span>'
-    if v == "REJECT":
-        return '<span class="verdict-reject">❌ Rejected</span>'
-    return '<span class="verdict-escalated">⏳ Pending</span>'
+    # Extract recommendation from agent output
+    raw_json = ((final_state.get("agent_output") or {}).get("raw_json") or {})
+    rec = raw_json.get("recommendation", "").upper().replace(" ", "_")
+
+    badge_map = {
+        "PERFECT_FIT": ("verdict-perfect-fit", "Perfect Fit"),
+        "STRONG_FIT":  ("verdict-strong-fit",  "Strong Fit"),
+        "GOOD_FIT":    ("verdict-good-fit",    "Good Fit"),
+        "MODERATE_FIT":("verdict-moderate-fit", "Moderate Fit"),
+        "LOW_FIT":     ("verdict-low-fit",     "Low Fit"),
+        "NO_FIT":      ("verdict-no-fit",      "No Fit"),
+        # Legacy mappings
+        "STRONG_YES":  ("verdict-perfect-fit",  "Perfect Fit"),
+        "YES":         ("verdict-strong-fit",   "Strong Fit"),
+        "MAYBE":       ("verdict-moderate-fit",  "Moderate Fit"),
+        "NO":          ("verdict-no-fit",        "No Fit"),
+    }
+
+    if rec in badge_map:
+        css_class, label = badge_map[rec]
+        return f'<span class="{css_class}">{label}</span>'
+
+    # Fallback: use confidence score
+    score = (final_state.get("agent_output") or {}).get("confidence_score", 0)
+    if score >= 0.9:
+        return '<span class="verdict-perfect-fit">Perfect Fit</span>'
+    if score >= 0.75:
+        return '<span class="verdict-strong-fit">Strong Fit</span>'
+    if score >= 0.6:
+        return '<span class="verdict-good-fit">Good Fit</span>'
+    if score >= 0.4:
+        return '<span class="verdict-moderate-fit">Moderate Fit</span>'
+    if score >= 0.2:
+        return '<span class="verdict-low-fit">Low Fit</span>'
+    if score > 0:
+        return '<span class="verdict-no-fit">No Fit</span>'
+    return '<span class="verdict-pending">Pending</span>'
 
 def render_audit(history):
     for i, event in enumerate(history, 1):
@@ -237,7 +290,7 @@ with main_tab_screening:
                 )
                 if err:
                     col_conf.caption("Error")
-                    col_badge.markdown('<span class="verdict-escalated">⚠️ Error</span>', unsafe_allow_html=True)
+                    col_badge.markdown('<span class="verdict-low-fit">⚠️ Error</span>', unsafe_allow_html=True)
                 else:
                     col_conf.progress(max(conf, 0), text=f"{conf:.0%} fit")
                     col_badge.markdown(verdict_badge(fs), unsafe_allow_html=True)
@@ -264,48 +317,102 @@ with main_tab_screening:
         is_scanning = st.session_state.get(scanning_key, False)
 
         with st.expander("⚙️ Screening filters & settings", expanded=len(applicants) > 50):
-            # Stage filter
-            all_stages = sorted({
-                ((a.get("stage") or {}).get("name") if isinstance(a.get("stage"), dict) else a.get("stage")) or "Unknown"
-                for a in applicants
-            })
-            selected_stages = st.multiselect(
-                "Only screen applicants in these stages",
-                options=all_stages,
-                default=all_stages,
-                key="screen_stages",
+            # Stage filter — fetch sub_stages from job posting's interview_process
+            job_detail = load_job_detail(job_id)
+            interview_process = job_detail.get("interview_process") or {}
+            sub_stages_list = interview_process.get("sub_stages") or []
+
+            # Parent stage ordering & labels
+            _PARENT_ORDER = {"leads": 0, "candidature": 1, "screening": 2, "on_site": 3, "offer": 4, "hire": 5}
+            _PARENT_LABELS = {
+                "leads": "Leads", "candidature": "Candidature", "screening": "Screening",
+                "on_site": "On-Site / Interviews", "offer": "Offer", "hire": "Hire",
+            }
+
+            # Build parent → sub_stage names map (ordered by position)
+            parent_to_subs = {}
+            for s in sorted(sub_stages_list, key=lambda s: s.get("position", 0)):
+                parent_to_subs.setdefault(s.get("stage", ""), []).append(s["name"])
+
+            # Get unique parent stages present in the pipeline, in order
+            parent_keys = sorted(parent_to_subs.keys(), key=lambda k: _PARENT_ORDER.get(k, 99))
+
+            # Helper: get applicant's parent stage value
+            def _applicant_parent_stage(a):
+                sv = a.get("stage")
+                if isinstance(sv, dict):
+                    return sv.get("name") or "Unknown"
+                return sv or "Unknown"
+
+            # Count applicants per parent stage
+            parent_counts = {}
+            for a in applicants:
+                ps = _applicant_parent_stage(a)
+                parent_counts[ps] = parent_counts.get(ps, 0) + 1
+
+            # ── Level 1: Parent stage filter ──
+            parent_options = [k for k in parent_keys]
+            def _format_parent(key):
+                label = _PARENT_LABELS.get(key, key.replace("_", " ").title())
+                count = parent_counts.get(key, 0)
+                return f"{label} ({count})" if count else label
+
+            selected_parents = st.multiselect(
+                "Filter by stage",
+                options=parent_options,
+                default=[],
+                format_func=_format_parent,
+                key="screen_parent_stages",
                 disabled=is_scanning,
+                placeholder="Choose stages...",
             )
 
-            f_col1, f_col2 = st.columns(2)
-            max_to_screen = f_col1.number_input(
-                "Max profiles to screen",
-                min_value=1,
-                max_value=len(applicants),
-                value=min(50, len(applicants)),
-                step=10,
-                key="screen_max",
-                disabled=is_scanning,
-                help="Caps the number of AI screening calls. Use with stage filter to target the right pool first.",
+            # ── Level 2: Sub-stage filter (populated from selected parents) ──
+            available_subs = []
+            for p in selected_parents:
+                available_subs.extend(parent_to_subs.get(p, []))
+
+            selected_subs = st.multiselect(
+                "Filter by sub-stage",
+                options=available_subs,
+                default=available_subs,
+                key="screen_sub_stages",
+                disabled=is_scanning or not selected_parents,
+                placeholder="Select parent stages first..." if not selected_parents else "Choose sub-stages...",
             )
-            workers = f_col2.slider(
+
+            # Build filtered list: match applicant parent stage AND only if a sub in that parent is selected
+            # Since API only gives parent stage, we filter by parent but only if at least one sub of that parent is selected
+            active_parents = set()
+            for sub_name in selected_subs:
+                for p, subs in parent_to_subs.items():
+                    if sub_name in subs:
+                        active_parents.add(p)
+
+            if selected_subs:
+                stage_filtered = [
+                    a for a in applicants
+                    if _applicant_parent_stage(a) in active_parents
+                ]
+            else:
+                stage_filtered = []
+
+            workers = st.slider(
                 "Parallel workers",
-                min_value=1, max_value=5, value=3,
+                min_value=1, max_value=5, value=5,
                 key="screen_workers",
-                disabled=is_scanning,
+                disabled=is_scanning or not selected_subs,
                 help="How many profiles to screen simultaneously. Higher = faster but more API load.",
             )
 
-            # Build the filtered list and show a preview
-            pre_filtered = [
-                a for a in applicants
-                if (((a.get("stage") or {}).get("name") if isinstance(a.get("stage"), dict)
-                     else a.get("stage")) or "Unknown") in selected_stages
-            ][:int(max_to_screen)]
-            st.caption(
-                f"**{len(pre_filtered)}** of **{len(applicants)}** applicants will be screened "
-                f"({workers} at a time)."
-            )
+            pre_filtered = stage_filtered
+            if selected_subs:
+                st.caption(
+                    f"**{len(pre_filtered)}** of **{len(applicants)}** applicants will be screened "
+                    f"({workers} at a time)."
+                )
+            else:
+                st.caption("Select stages and sub-stages to begin screening.")
 
         # Store filtered queue in session state when scan starts
         scan_queue_key = f"scan_queue_{job_id}"
@@ -313,7 +420,7 @@ with main_tab_screening:
         # ── Button row ────────────────────────────────────────────────────────
         btn_col, stop_col = st.columns([2, 1])
         if btn_col.button("Screen & Rank All", type="primary", key="rank_all",
-                          disabled=is_scanning):
+                          disabled=is_scanning or not selected_subs):
             st.session_state[scanning_key]  = True
             st.session_state[scan_buf_key]  = []
             st.session_state[scan_queue_key] = pre_filtered   # snapshot the filtered list
@@ -387,7 +494,7 @@ with main_tab_screening:
             kw_col, btn_col, clear_col = st.columns([4, 1.2, 1])
             kw_input = kw_col.text_input(
                 "kw_rank_label",
-                placeholder="Filter by keywords (comma-separated) — e.g. Chandigarh University, entrepreneur, AWS",
+                placeholder="Smart filter — e.g. tier 1, FAANG experience, entrepreneur, D2C, startup",
                 label_visibility="collapsed",
                 key="kw_rank_input",
             )
@@ -400,52 +507,49 @@ with main_tab_screening:
                 st.rerun()
 
             if apply_kw_rank and kw_input.strip():
-                keywords = [k.strip() for k in kw_input.split(",") if k.strip()]
+                query = kw_input.strip()
                 matched = []
                 oai_kw = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-                prog_kw = st.progress(0, text="Filtering...")
+                prog_kw = st.progress(0, text="AI filtering...")
                 for i, r in enumerate(results):
                     resume_text = r.get("task_input", {}).get("resume_text", "") or r.get("name", "")
-                    resume_normalized = " ".join(resume_text.split()).lower()
-                    all_matched = True
-                    for kw in keywords:
-                        kw_lower = kw.lower()
-                        kw_found = False
-                        if kw_lower in resume_normalized:
-                            kw_found = True
-                        else:
-                            try:
-                                resp = oai_kw.chat.completions.create(
-                                    model="gpt-4o-mini",
-                                    max_tokens=10,
-                                    messages=[
-                                        {
-                                            "role": "system",
-                                            "content": (
-                                                "You are a smart candidate filter. Given a keyword/phrase and a resume, "
-                                                "reply ONLY 'yes' or 'no': does this resume match the keyword concept?\n"
-                                                "Be semantically intelligent:\n"
-                                                "- 'entrepreneur' → co-founded, startup founder, own business\n"
-                                                "- 'tier 1 college' → IIT, IIM, IISc, NIT, top-ranked university\n"
-                                                "- 'fintech' → payments, banking tech, neo-bank, lending\n"
-                                                "Match intent, not just exact words."
-                                            ),
-                                        },
-                                        {"role": "user", "content": f"Keyword: {kw}\n\nResume:\n{resume_text[:3000]}"},
-                                    ],
-                                )
-                                if resp.choices[0].message.content.strip().lower().startswith("yes"):
-                                    kw_found = True
-                            except Exception:
-                                kw_found = True
-                        if not kw_found:
-                            all_matched = False
-                            break
-                    if all_matched:
+                    try:
+                        resp = oai_kw.chat.completions.create(
+                            model="gpt-4o-mini",
+                            max_tokens=5,
+                            temperature=0,
+                            messages=[
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "You are a smart recruiter filter. Given a search query and a resume, "
+                                        "reply ONLY 'yes' or 'no'.\n\n"
+                                        "Be semantically intelligent — match INTENT, not just exact words:\n"
+                                        "- 'tier 1' or 'tier 1 college' → IIT, IIM, IISc, NIT, BITS Pilani, "
+                                        "Delhi University, NSUT, DTU, ISI, IIIT-H, top-50 NIRF-ranked institutions\n"
+                                        "- 'tier 2' → decent but non-elite: state universities, Amity, LPU, "
+                                        "Chandigarh Univ, Manipal, VIT, SRM, etc.\n"
+                                        "- 'entrepreneur' → co-founded, startup founder, own business, CEO of own venture\n"
+                                        "- 'fintech' → payments, banking tech, neo-bank, lending platform\n"
+                                        "- 'FAANG' → Google, Meta, Amazon, Apple, Netflix, Microsoft\n"
+                                        "- 'remote' → works remotely, distributed team\n"
+                                        "- 'startup experience' → early-stage company, Series A/B, small team\n"
+                                        "- 'D2C' → direct to consumer brand, Shopify, e-commerce brand\n"
+                                        "- 'product management' → PM, product manager, product owner, roadmap\n\n"
+                                        "For comma-separated queries, ALL criteria must match. "
+                                        "Think about what a recruiter means, not literal text."
+                                    ),
+                                },
+                                {"role": "user", "content": f"Query: {query}\n\nResume:\n{resume_text[:3000]}"},
+                            ],
+                        )
+                        if resp.choices[0].message.content.strip().lower().startswith("yes"):
+                            matched.append(r["applicant_id"])
+                    except Exception:
                         matched.append(r["applicant_id"])
                     prog_kw.progress((i + 1) / len(results))
                 prog_kw.empty()
-                st.session_state["kw_rank_active"] = kw_input.strip()
+                st.session_state["kw_rank_active"] = query
                 st.session_state["kw_rank_matched"] = matched
                 st.rerun()
 
