@@ -176,96 +176,16 @@ with main_tab_screening:
             st.session_state.manual_job_ids.append(int(new_id))
             st.rerun()
     else:
-        # ── Search bar ────────────────────────────────────────────────────────
-        job_search = st.text_input(
-            "job_search_label",
-            placeholder="🔍  Search job postings…",
-            label_visibility="collapsed",
-            key="job_search_query",
+        # ── Job dropdown (searchable) ─────────────────────────────────────────
+        job_options = {j["id"]: j.get("title", "Untitled") for j in jobs}
+        job_ids = list(job_options.keys())
+        selected_job = st.selectbox(
+            "Select Job Posting",
+            options=job_ids,
+            format_func=lambda jid: f"{job_options[jid]}  (#{jid})",
+            key="selected_job_id",
         )
-
-        query = job_search.strip().lower()
-        filtered_jobs = [
-            j for j in jobs
-            if query in j.get("title", "").lower() or query in str(j["id"])
-        ] if query else jobs
-
-        # ── Pagination state ──────────────────────────────────────────────────
-        JOB_CARDS_PER_PAGE = 6
-        total_job_pages = max(1, (len(filtered_jobs) + JOB_CARDS_PER_PAGE - 1) // JOB_CARDS_PER_PAGE)
-
-        if "job_page" not in st.session_state or st.session_state.get("_last_job_query") != query:
-            st.session_state.job_page = 1
-            st.session_state["_last_job_query"] = query
-
-        job_page = st.session_state.job_page
-        j_start = (job_page - 1) * JOB_CARDS_PER_PAGE
-        j_end = min(j_start + JOB_CARDS_PER_PAGE, len(filtered_jobs))
-        page_jobs = filtered_jobs[j_start:j_end]
-
-        if not filtered_jobs:
-            st.warning("No job postings match your search.")
-            st.stop()
-
-        # ── Initialise selected job ───────────────────────────────────────────
-        if "selected_job_id" not in st.session_state:
-            st.session_state.selected_job_id = jobs[0]["id"]
-
-        # ── Job cards grid (3 columns) ────────────────────────────────────────
-        JOB_COLS = 3
-        for row_start in range(0, len(page_jobs), JOB_COLS):
-            row_jobs = page_jobs[row_start:row_start + JOB_COLS]
-            cols = st.columns(JOB_COLS)
-            for col, j in zip(cols, row_jobs):
-                jid = j["id"]
-                title = j.get("title", "Untitled")
-                status = j.get("status", "")
-                dept = (j.get("department") or {}).get("name", "") if isinstance(j.get("department"), dict) else ""
-                location = ""
-                for loc in (j.get("branch_id_list") or j.get("locations") or []):
-                    if isinstance(loc, dict):
-                        location = loc.get("name", "")
-                        break
-                is_selected = st.session_state.selected_job_id == jid
-                border_color = "#4f8ef7" if is_selected else "#dee2e6"
-                bg_color = "#f0f5ff" if is_selected else "#ffffff"
-                with col:
-                    st.markdown(
-                        f"""<div style="border:2px solid {border_color};border-radius:10px;
-                        padding:14px 16px;background:{bg_color};min-height:110px;margin-bottom:4px;">
-                        <div style="font-weight:700;font-size:0.92rem;margin-bottom:4px;">{title}</div>
-                        <div style="font-size:0.75rem;color:#6c757d;">ID: {jid}</div>
-                        {"<div style='font-size:0.75rem;color:#6c757d;'>🏢 " + dept + "</div>" if dept else ""}                        
-                        </div>""",
-                        unsafe_allow_html=True,
-                    )
-                    btn_label = "✔ Selected" if is_selected else "Select"
-                    if col.button(btn_label, key=f"select_job_{jid}", use_container_width=True, disabled=is_selected):
-                        st.session_state.selected_job_id = jid
-                        st.rerun()
-
-        # ── Pagination controls ───────────────────────────────────────────────
-        if total_job_pages > 1:
-            st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-            pc1, pc2, pc3, pc4, pc5 = st.columns([1, 0.4, 0.5, 0.4, 1])
-            if pc2.button("◀", key="job_prev", disabled=job_page == 1):
-                st.session_state.job_page = job_page - 1
-                st.rerun()
-            pc3.markdown(
-                f"<div style='text-align:center;padding-top:6px;font-size:0.85rem'>{job_page}/{total_job_pages}</div>",
-                unsafe_allow_html=True,
-            )
-            if pc4.button("▶", key="job_next", disabled=job_page == total_job_pages):
-                st.session_state.job_page = job_page + 1
-                st.rerun()
-
-        job_id = st.session_state.selected_job_id
-        selected_job_title = next((j.get("title", "") for j in jobs if j["id"] == job_id), "")
-        st.markdown(
-            f"<div style='margin-top:8px;font-size:0.85rem;color:#4f8ef7;font-weight:600;'>"
-            f"Selected: {selected_job_title} (#{job_id})</div>",
-            unsafe_allow_html=True,
-        )
+        job_id = selected_job
 
     st.divider()
 
@@ -274,85 +194,7 @@ with main_tab_screening:
         st.warning("No applicants found for this job.")
         st.stop()
 
-    st.caption(f"{len(applicants)} applicant(s) found")
-
-    # ── Applicant cards with search + pagination ──────────────────────────────
-    app_search = st.text_input(
-        "app_search_label",
-        placeholder="🔍  Search applicants by name, email, or stage…",
-        label_visibility="collapsed",
-        key=f"app_search_{job_id}",
-    )
-    app_query = app_search.strip().lower()
-
-    def _app_matches(app, q):
-        c = app.get("candidate") or app
-        name = f"{c.get('first_name', '')} {c.get('last_name', '')}".strip().lower()
-        email = (c.get("email") or "").lower()
-        stage = app.get("stage", {})
-        stage_name = (stage.get("name") if isinstance(stage, dict) else stage or "").lower()
-        return q in name or q in email or q in stage_name or q in str(app["id"])
-
-    filtered_applicants = [a for a in applicants if _app_matches(a, app_query)] if app_query else applicants
-
-    if app_query:
-        st.caption(f"{len(filtered_applicants)} of {len(applicants)} applicant(s) matched")
-
-    CARDS_PER_PAGE = 8
-    total_pages = max(1, (len(filtered_applicants) + CARDS_PER_PAGE - 1) // CARDS_PER_PAGE)
-    page_key = f"applicant_page_{job_id}"
-    # Reset to page 1 if search query changed
-    if st.session_state.get(f"_last_app_query_{job_id}") != app_query:
-        st.session_state[page_key] = 1
-        st.session_state[f"_last_app_query_{job_id}"] = app_query
-    if page_key not in st.session_state:
-        st.session_state[page_key] = 1
-    current_page = st.session_state[page_key]
-    page_start = (current_page - 1) * CARDS_PER_PAGE
-    page_end = min(page_start + CARDS_PER_PAGE, len(filtered_applicants))
-    page_applicants = filtered_applicants[page_start:page_end]
-
-    cols_per_row = 4
-    for row_start in range(0, len(page_applicants), cols_per_row):
-        row_apps = page_applicants[row_start:row_start + cols_per_row]
-        cols = st.columns(cols_per_row)
-        for col, app in zip(cols, row_apps):
-            c = app.get("candidate") or app
-            name = f"{c.get('first_name', '')} {c.get('last_name', '')}".strip() or f"Applicant #{app['id']}"
-            email = c.get("email", "")
-            stage = app.get("stage", {})
-            stage_name = (stage.get("name") if isinstance(stage, dict) else stage) or "—"
-            source = app.get("source") or "—"
-            ft_url = f"https://gonoise.freshteam.com/hire/jobs/{job_id}/applicants/listview/{app['id']}"
-            with col:
-                st.markdown(
-                    f"""<div style="border:1px solid #dee2e6;border-radius:10px;padding:14px 16px;
-                    background:#fff;min-height:130px;">
-                    <div style="font-weight:700;font-size:0.95rem;margin-bottom:4px;">{name}</div>
-                    <div style="font-size:0.78rem;color:#6c757d;">ID: {app['id']}</div>
-                    {"<div style='font-size:0.78rem;color:#6c757d;'>📧 " + email + "</div>" if email else ""}
-                    <div style="font-size:0.78rem;color:#6c757d;">📌 {stage_name}</div>
-                    <div style="font-size:0.78rem;color:#6c757d;">🔎 {source}</div>
-                    <a href="{ft_url}" target="_blank" style="text-decoration:none;">
-                    <button style="margin-top:8px;padding:2px 10px;font-size:11px;border-radius:5px;
-                    border:1px solid #ccc;background:#f0f2f6;cursor:pointer;">🔗 Profile</button></a>
-                    </div>""",
-                    unsafe_allow_html=True,
-                )
-
-    if total_pages > 1:
-        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-        p_cols = st.columns([1, 0.4, 0.4, 0.4, 1])
-        if p_cols[1].button("◀", key=f"prev_page_{job_id}", disabled=current_page == 1):
-            st.session_state[page_key] = current_page - 1
-            st.rerun()
-        p_cols[2].markdown(
-            f"<div style='text-align:center;padding-top:6px;font-size:0.85rem'>{current_page}/{total_pages}</div>",
-            unsafe_allow_html=True,
-        )
-        if p_cols[3].button("▶", key=f"next_page_{job_id}", disabled=current_page == total_pages):
-            st.session_state[page_key] = current_page + 1
-            st.rerun()
+    st.info(f"**{len(applicants)}** applicant(s) found for this job posting.")
 
     st.divider()
 
