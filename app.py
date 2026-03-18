@@ -772,7 +772,11 @@ with main_tab_screening:
                         location = loc_raw or "—"
                     emails = p.get("emails") or []
                     email = emails[0].get("email", "—") if emails and isinstance(emails[0], dict) else "—"
-                    skills = ", ".join(p.get("topSkills") or []) or "—"
+                    skills_data = p.get("topSkills") or []
+                    if isinstance(skills_data, str):
+                        skills = skills_data
+                    else:
+                        skills = ", ".join(s.get("name", s) if isinstance(s, dict) else str(s) for s in skills_data) or "—"
                     open_to_work = "  ✅ Open to Work" if p.get("openToWork") else ""
                     linkedin_url = p.get("linkedinUrl", "")
 
