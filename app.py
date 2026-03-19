@@ -131,6 +131,38 @@ def run_screening(job_id, applicant_id):
     }
     return hr_graph.invoke(state), task_input
 
+
+def run_screening_fast(task_input: dict) -> tuple[dict, dict]:
+    """
+    Fast screening path for bulk operations.
+    Skips the full graph (no dispatcher, no manager review loop).
+    Uses gpt-4o for consistent scoring. Returns (fake_final_state, task_input).
+    """
+    from hr_system.agents.base import call_llm
+    from hr_system.prompts.resume_screener import SYSTEM_PROMPT, build_user_prompt
+
+    user_prompt = build_user_prompt(
+        resume_text=task_input.get("resume_text", ""),
+        job_description=task_input.get("job_description", ""),
+        job_title=task_input.get("job_title", ""),
+    )
+    raw = call_llm(SYSTEM_PROMPT, user_prompt, expect_json=True)
+
+    agent_output = {
+        "content": raw.get("content", ""),
+        "confidence_score": float(raw.get("confidence_score", 0.5)),
+        "reasoning": raw.get("reasoning", ""),
+        "raw_json": raw,
+    }
+    final_state = {
+        "task_type": "resume_screening",
+        "task_input": task_input,
+        "agent_output": agent_output,
+        "manager_decision": {"verdict": "APPROVE", "feedback": ""},
+        "final_result": agent_output["content"],
+    }
+    return final_state, task_input
+
 def run_scheduling(job_id, applicant_id, slots):
     client = FreshteamClient()
     task_input = client.build_interview_scheduling_input(job_id, applicant_id, slots)
@@ -399,10 +431,10 @@ with main_tab_screening:
 
             workers = st.slider(
                 "Parallel workers",
-                min_value=1, max_value=5, value=5,
+                min_value=1, max_value=20, value=5,
                 key="screen_workers",
                 disabled=is_scanning or not selected_subs,
-                help="How many profiles to screen simultaneously. Higher = faster but more API load.",
+                help="How many profiles to screen simultaneously. Start at 5, increase cautiously.",
             )
 
             pre_filtered = stage_filtered
@@ -419,11 +451,25 @@ with main_tab_screening:
 
         # ── Button row ────────────────────────────────────────────────────────
         btn_col, stop_col = st.columns([2, 1])
+        job_data_key = f"job_data_{job_id}"
+        pre_cached_inputs_key = f"pre_cached_inputs_{job_id}"
         if btn_col.button("Screen & Rank All", type="primary", key="rank_all",
                           disabled=is_scanning or not selected_subs):
             st.session_state[scanning_key]  = True
             st.session_state[scan_buf_key]  = []
             st.session_state[scan_queue_key] = pre_filtered   # snapshot the filtered list
+            st.session_state[job_data_key]  = load_job_detail(job_id)  # fetch once
+
+            # Pre-fetch all resume texts SEQUENTIALLY before parallel screening starts
+            job_data = st.session_state[job_data_key]
+            ft_client = FreshteamClient()
+            pre_cached = {}
+            with st.spinner(f"Preparing {len(pre_filtered)} resumes…"):
+                for app in pre_filtered:
+                    task_input = ft_client.build_screening_input_from_data(job_data, app)
+                    pre_cached[app["id"]] = task_input
+            st.session_state[pre_cached_inputs_key] = pre_cached
+
             st.session_state.pop(ranked_key, None)
             st.session_state.pop("kw_rank_active", None)
             st.session_state.pop("kw_rank_matched", None)
@@ -446,7 +492,7 @@ with main_tab_screening:
             done     = len(scanned)
             w        = st.session_state.get("screen_workers", 3)
 
-            st.progress(done / total, text=f"Screened {done}/{total}…")
+            st.progress(done / total if total else 0, text=f"Screened {done}/{total}…")
 
             # Render already-scanned cards (live — no expander)
             for i, r in enumerate(scanned, 1):
@@ -455,6 +501,8 @@ with main_tab_screening:
             if done < total:
                 batch_apps = queue[done:done + w]
                 names = ", ".join(applicant_label(a) for a in batch_apps)
+                pre_cached = st.session_state.get(pre_cached_inputs_key, {})
+
                 with st.spinner(f"Scanning {done+1}–{min(done+w, total)}/{total}: {names}…"):
                     batch_results = []
 
@@ -462,7 +510,13 @@ with main_tab_screening:
                         name = applicant_label(app)
                         aid  = app["id"]
                         try:
-                            fs, ti = run_screening(job_id, aid)
+                            # Use pre-cached task input (resume already fetched sequentially)
+                            ti = pre_cached.get(aid)
+                            if not ti:
+                                return {"name": name, "applicant_id": aid, "confidence": -1,
+                                        "error": "Applicant not prepared", "final_state": {}, "task_input": {}}
+
+                            fs, ti = run_screening_fast(ti)
                             conf = (fs.get("agent_output") or {}).get("confidence_score", 0.0)
                             return {"name": name, "applicant_id": aid, "confidence": conf,
                                     "final_state": fs, "task_input": ti}

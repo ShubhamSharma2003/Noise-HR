@@ -21,9 +21,20 @@ class FreshteamClient:
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _get(self, path: str, params: dict = None) -> requests.Response:
+    def _get(self, path: str, params: dict = None, retries: int = 5) -> requests.Response:
         url = f"{self.base_url}{path}"
-        response = requests.get(url, headers=self.headers, params=params or {})
+        for attempt in range(retries):
+            response = requests.get(url, headers=self.headers, params=params or {}, timeout=30)
+            if response.status_code == 429 or response.status_code >= 500:
+                wait = min(2 ** attempt, 30)  # 1, 2, 4, 8, 16 … capped at 30s
+                retry_after = response.headers.get("Retry-After")
+                if retry_after:
+                    wait = max(wait, int(retry_after))
+                time.sleep(wait)
+                continue
+            response.raise_for_status()
+            return response
+        # Final attempt — let it raise
         response.raise_for_status()
         return response
 
@@ -49,7 +60,7 @@ class FreshteamClient:
             if page >= total_pages:
                 break
             page += 1
-            time.sleep(0.1)  # stay under rate limit
+            time.sleep(0.5)  # stay under rate limit
         return results
 
     # ── Public methods ────────────────────────────────────────────────────────
