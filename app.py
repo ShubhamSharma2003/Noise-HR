@@ -147,6 +147,25 @@ def run_scheduling(job_id, applicant_id, slots):
     }
     return hr_graph.invoke(state), task_input
 
+_VERDICT_RANK = {
+    "PERFECT_FIT": 0, "STRONG_YES": 0,
+    "STRONG_FIT":  1, "YES":        1,
+    "GOOD_FIT":    2,
+    "MODERATE_FIT":3, "MAYBE":      3,
+    "LOW_FIT":     4,
+    "NO_FIT":      5, "NO":         5,
+}
+
+def _verdict_sort_key(r):
+    """Primary: verdict rank (lower = better). Secondary: confidence descending."""
+    if r.get("error"):
+        return (99, 0)
+    fs = r.get("final_state", {})
+    raw_json = ((fs.get("agent_output") or {}).get("raw_json") or {})
+    rec = raw_json.get("recommendation", "").upper().replace(" ", "_")
+    rank = _VERDICT_RANK.get(rec, 6)
+    return (rank, -r.get("confidence", 0))
+
 def verdict_badge(final_state):
     # Extract recommendation from agent output
     raw_json = ((final_state.get("agent_output") or {}).get("raw_json") or {})
@@ -434,7 +453,7 @@ with main_tab_screening:
             st.session_state[scanning_key] = False
             scanned = st.session_state.get(scan_buf_key, [])
             if scanned:
-                scanned.sort(key=lambda r: r["confidence"], reverse=True)
+                scanned.sort(key=_verdict_sort_key)
                 st.session_state[ranked_key] = scanned
             st.rerun()
 
@@ -480,7 +499,7 @@ with main_tab_screening:
                 st.rerun()
             else:
                 # All done — sort and persist
-                scanned.sort(key=lambda r: r["confidence"], reverse=True)
+                scanned.sort(key=_verdict_sort_key)
                 st.session_state[ranked_key]   = scanned
                 st.session_state[scanning_key] = False
                 st.rerun()
