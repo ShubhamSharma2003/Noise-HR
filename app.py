@@ -16,17 +16,37 @@ st.set_page_config(page_title="HR Agent System", page_icon="🧑‍💼", layout
 
 st.markdown("""
 <style>
-.verdict-approve {
+.verdict-perfect-fit {
+    background:#c3e6cb;color:#155724;
+    padding:6px 14px;border-radius:6px;
+    font-weight:bold;display:inline-block;
+}
+.verdict-strong-fit {
     background:#d4edda;color:#155724;
     padding:6px 14px;border-radius:6px;
     font-weight:bold;display:inline-block;
 }
-.verdict-reject {
+.verdict-good-fit {
+    background:#d1ecf1;color:#0c5460;
+    padding:6px 14px;border-radius:6px;
+    font-weight:bold;display:inline-block;
+}
+.verdict-moderate-fit {
+    background:#fff3cd;color:#856404;
+    padding:6px 14px;border-radius:6px;
+    font-weight:bold;display:inline-block;
+}
+.verdict-low-fit {
     background:#f8d7da;color:#721c24;
     padding:6px 14px;border-radius:6px;
     font-weight:bold;display:inline-block;
 }
-.verdict-escalated {
+.verdict-no-fit {
+    background:#d6d8d9;color:#1b1e21;
+    padding:6px 14px;border-radius:6px;
+    font-weight:bold;display:inline-block;
+}
+.verdict-pending {
     background:#fff3cd;color:#856404;
     padding:6px 14px;border-radius:6px;
     font-weight:bold;display:inline-block;
@@ -86,6 +106,10 @@ def load_jobs():
 def load_applicants(job_id):
     return FreshteamClient().get_applicants(job_id)
 
+@st.cache_data(show_spinner="Fetching job details...", ttl=60)
+def load_job_detail(job_id):
+    return FreshteamClient().get_job_posting(job_id)
+
 def applicant_label(a):
     c = a.get("candidate") or a
     name = f"{c.get('first_name','')} {c.get('last_name','')}".strip()
@@ -124,14 +148,43 @@ def run_scheduling(job_id, applicant_id, slots):
     return hr_graph.invoke(state), task_input
 
 def verdict_badge(final_state):
-    if final_state.get("escalated_to_cos"):
-        return '<span class="verdict-escalated">⚠️ Escalated</span>'
-    v = (final_state.get("manager_decision") or {}).get("verdict", "")
-    if v == "APPROVE":
-        return '<span class="verdict-approve">✅ Approved</span>'
-    if v == "REJECT":
-        return '<span class="verdict-reject">❌ Rejected</span>'
-    return '<span class="verdict-escalated">⏳ Pending</span>'
+    # Extract recommendation from agent output
+    raw_json = ((final_state.get("agent_output") or {}).get("raw_json") or {})
+    rec = raw_json.get("recommendation", "").upper().replace(" ", "_")
+
+    badge_map = {
+        "PERFECT_FIT": ("verdict-perfect-fit", "Perfect Fit"),
+        "STRONG_FIT":  ("verdict-strong-fit",  "Strong Fit"),
+        "GOOD_FIT":    ("verdict-good-fit",    "Good Fit"),
+        "MODERATE_FIT":("verdict-moderate-fit", "Moderate Fit"),
+        "LOW_FIT":     ("verdict-low-fit",     "Low Fit"),
+        "NO_FIT":      ("verdict-no-fit",      "No Fit"),
+        # Legacy mappings
+        "STRONG_YES":  ("verdict-perfect-fit",  "Perfect Fit"),
+        "YES":         ("verdict-strong-fit",   "Strong Fit"),
+        "MAYBE":       ("verdict-moderate-fit",  "Moderate Fit"),
+        "NO":          ("verdict-no-fit",        "No Fit"),
+    }
+
+    if rec in badge_map:
+        css_class, label = badge_map[rec]
+        return f'<span class="{css_class}">{label}</span>'
+
+    # Fallback: use confidence score
+    score = (final_state.get("agent_output") or {}).get("confidence_score", 0)
+    if score >= 0.9:
+        return '<span class="verdict-perfect-fit">Perfect Fit</span>'
+    if score >= 0.75:
+        return '<span class="verdict-strong-fit">Strong Fit</span>'
+    if score >= 0.6:
+        return '<span class="verdict-good-fit">Good Fit</span>'
+    if score >= 0.4:
+        return '<span class="verdict-moderate-fit">Moderate Fit</span>'
+    if score >= 0.2:
+        return '<span class="verdict-low-fit">Low Fit</span>'
+    if score > 0:
+        return '<span class="verdict-no-fit">No Fit</span>'
+    return '<span class="verdict-pending">Pending</span>'
 
 def render_audit(history):
     for i, event in enumerate(history, 1):
@@ -176,96 +229,16 @@ with main_tab_screening:
             st.session_state.manual_job_ids.append(int(new_id))
             st.rerun()
     else:
-        # ── Search bar ────────────────────────────────────────────────────────
-        job_search = st.text_input(
-            "job_search_label",
-            placeholder="🔍  Search job postings…",
-            label_visibility="collapsed",
-            key="job_search_query",
+        # ── Job dropdown (searchable) ─────────────────────────────────────────
+        job_options = {j["id"]: j.get("title", "Untitled") for j in jobs}
+        job_ids = list(job_options.keys())
+        selected_job = st.selectbox(
+            "Select Job Posting",
+            options=job_ids,
+            format_func=lambda jid: f"{job_options[jid]}  (#{jid})",
+            key="selected_job_id",
         )
-
-        query = job_search.strip().lower()
-        filtered_jobs = [
-            j for j in jobs
-            if query in j.get("title", "").lower() or query in str(j["id"])
-        ] if query else jobs
-
-        # ── Pagination state ──────────────────────────────────────────────────
-        JOB_CARDS_PER_PAGE = 6
-        total_job_pages = max(1, (len(filtered_jobs) + JOB_CARDS_PER_PAGE - 1) // JOB_CARDS_PER_PAGE)
-
-        if "job_page" not in st.session_state or st.session_state.get("_last_job_query") != query:
-            st.session_state.job_page = 1
-            st.session_state["_last_job_query"] = query
-
-        job_page = st.session_state.job_page
-        j_start = (job_page - 1) * JOB_CARDS_PER_PAGE
-        j_end = min(j_start + JOB_CARDS_PER_PAGE, len(filtered_jobs))
-        page_jobs = filtered_jobs[j_start:j_end]
-
-        if not filtered_jobs:
-            st.warning("No job postings match your search.")
-            st.stop()
-
-        # ── Initialise selected job ───────────────────────────────────────────
-        if "selected_job_id" not in st.session_state:
-            st.session_state.selected_job_id = jobs[0]["id"]
-
-        # ── Job cards grid (3 columns) ────────────────────────────────────────
-        JOB_COLS = 3
-        for row_start in range(0, len(page_jobs), JOB_COLS):
-            row_jobs = page_jobs[row_start:row_start + JOB_COLS]
-            cols = st.columns(JOB_COLS)
-            for col, j in zip(cols, row_jobs):
-                jid = j["id"]
-                title = j.get("title", "Untitled")
-                status = j.get("status", "")
-                dept = (j.get("department") or {}).get("name", "") if isinstance(j.get("department"), dict) else ""
-                location = ""
-                for loc in (j.get("branch_id_list") or j.get("locations") or []):
-                    if isinstance(loc, dict):
-                        location = loc.get("name", "")
-                        break
-                is_selected = st.session_state.selected_job_id == jid
-                border_color = "#4f8ef7" if is_selected else "#dee2e6"
-                bg_color = "#f0f5ff" if is_selected else "#ffffff"
-                with col:
-                    st.markdown(
-                        f"""<div style="border:2px solid {border_color};border-radius:10px;
-                        padding:14px 16px;background:{bg_color};min-height:110px;margin-bottom:4px;">
-                        <div style="font-weight:700;font-size:0.92rem;margin-bottom:4px;">{title}</div>
-                        <div style="font-size:0.75rem;color:#6c757d;">ID: {jid}</div>
-                        {"<div style='font-size:0.75rem;color:#6c757d;'>🏢 " + dept + "</div>" if dept else ""}                        
-                        </div>""",
-                        unsafe_allow_html=True,
-                    )
-                    btn_label = "✔ Selected" if is_selected else "Select"
-                    if col.button(btn_label, key=f"select_job_{jid}", use_container_width=True, disabled=is_selected):
-                        st.session_state.selected_job_id = jid
-                        st.rerun()
-
-        # ── Pagination controls ───────────────────────────────────────────────
-        if total_job_pages > 1:
-            st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-            pc1, pc2, pc3, pc4, pc5 = st.columns([1, 0.4, 0.5, 0.4, 1])
-            if pc2.button("◀", key="job_prev", disabled=job_page == 1):
-                st.session_state.job_page = job_page - 1
-                st.rerun()
-            pc3.markdown(
-                f"<div style='text-align:center;padding-top:6px;font-size:0.85rem'>{job_page}/{total_job_pages}</div>",
-                unsafe_allow_html=True,
-            )
-            if pc4.button("▶", key="job_next", disabled=job_page == total_job_pages):
-                st.session_state.job_page = job_page + 1
-                st.rerun()
-
-        job_id = st.session_state.selected_job_id
-        selected_job_title = next((j.get("title", "") for j in jobs if j["id"] == job_id), "")
-        st.markdown(
-            f"<div style='margin-top:8px;font-size:0.85rem;color:#4f8ef7;font-weight:600;'>"
-            f"Selected: {selected_job_title} (#{job_id})</div>",
-            unsafe_allow_html=True,
-        )
+        job_id = selected_job
 
     st.divider()
 
@@ -274,85 +247,7 @@ with main_tab_screening:
         st.warning("No applicants found for this job.")
         st.stop()
 
-    st.caption(f"{len(applicants)} applicant(s) found")
-
-    # ── Applicant cards with search + pagination ──────────────────────────────
-    app_search = st.text_input(
-        "app_search_label",
-        placeholder="🔍  Search applicants by name, email, or stage…",
-        label_visibility="collapsed",
-        key=f"app_search_{job_id}",
-    )
-    app_query = app_search.strip().lower()
-
-    def _app_matches(app, q):
-        c = app.get("candidate") or app
-        name = f"{c.get('first_name', '')} {c.get('last_name', '')}".strip().lower()
-        email = (c.get("email") or "").lower()
-        stage = app.get("stage", {})
-        stage_name = (stage.get("name") if isinstance(stage, dict) else stage or "").lower()
-        return q in name or q in email or q in stage_name or q in str(app["id"])
-
-    filtered_applicants = [a for a in applicants if _app_matches(a, app_query)] if app_query else applicants
-
-    if app_query:
-        st.caption(f"{len(filtered_applicants)} of {len(applicants)} applicant(s) matched")
-
-    CARDS_PER_PAGE = 8
-    total_pages = max(1, (len(filtered_applicants) + CARDS_PER_PAGE - 1) // CARDS_PER_PAGE)
-    page_key = f"applicant_page_{job_id}"
-    # Reset to page 1 if search query changed
-    if st.session_state.get(f"_last_app_query_{job_id}") != app_query:
-        st.session_state[page_key] = 1
-        st.session_state[f"_last_app_query_{job_id}"] = app_query
-    if page_key not in st.session_state:
-        st.session_state[page_key] = 1
-    current_page = st.session_state[page_key]
-    page_start = (current_page - 1) * CARDS_PER_PAGE
-    page_end = min(page_start + CARDS_PER_PAGE, len(filtered_applicants))
-    page_applicants = filtered_applicants[page_start:page_end]
-
-    cols_per_row = 4
-    for row_start in range(0, len(page_applicants), cols_per_row):
-        row_apps = page_applicants[row_start:row_start + cols_per_row]
-        cols = st.columns(cols_per_row)
-        for col, app in zip(cols, row_apps):
-            c = app.get("candidate") or app
-            name = f"{c.get('first_name', '')} {c.get('last_name', '')}".strip() or f"Applicant #{app['id']}"
-            email = c.get("email", "")
-            stage = app.get("stage", {})
-            stage_name = (stage.get("name") if isinstance(stage, dict) else stage) or "—"
-            source = app.get("source") or "—"
-            ft_url = f"https://gonoise.freshteam.com/hire/jobs/{job_id}/applicants/listview/{app['id']}"
-            with col:
-                st.markdown(
-                    f"""<div style="border:1px solid #dee2e6;border-radius:10px;padding:14px 16px;
-                    background:#fff;min-height:130px;">
-                    <div style="font-weight:700;font-size:0.95rem;margin-bottom:4px;">{name}</div>
-                    <div style="font-size:0.78rem;color:#6c757d;">ID: {app['id']}</div>
-                    {"<div style='font-size:0.78rem;color:#6c757d;'>📧 " + email + "</div>" if email else ""}
-                    <div style="font-size:0.78rem;color:#6c757d;">📌 {stage_name}</div>
-                    <div style="font-size:0.78rem;color:#6c757d;">🔎 {source}</div>
-                    <a href="{ft_url}" target="_blank" style="text-decoration:none;">
-                    <button style="margin-top:8px;padding:2px 10px;font-size:11px;border-radius:5px;
-                    border:1px solid #ccc;background:#f0f2f6;cursor:pointer;">🔗 Profile</button></a>
-                    </div>""",
-                    unsafe_allow_html=True,
-                )
-
-    if total_pages > 1:
-        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-        p_cols = st.columns([1, 0.4, 0.4, 0.4, 1])
-        if p_cols[1].button("◀", key=f"prev_page_{job_id}", disabled=current_page == 1):
-            st.session_state[page_key] = current_page - 1
-            st.rerun()
-        p_cols[2].markdown(
-            f"<div style='text-align:center;padding-top:6px;font-size:0.85rem'>{current_page}/{total_pages}</div>",
-            unsafe_allow_html=True,
-        )
-        if p_cols[3].button("▶", key=f"next_page_{job_id}", disabled=current_page == total_pages):
-            st.session_state[page_key] = current_page + 1
-            st.rerun()
+    st.info(f"**{len(applicants)}** applicant(s) found for this job posting.")
 
     st.divider()
 
@@ -395,7 +290,7 @@ with main_tab_screening:
                 )
                 if err:
                     col_conf.caption("Error")
-                    col_badge.markdown('<span class="verdict-escalated">⚠️ Error</span>', unsafe_allow_html=True)
+                    col_badge.markdown('<span class="verdict-low-fit">⚠️ Error</span>', unsafe_allow_html=True)
                 else:
                     col_conf.progress(max(conf, 0), text=f"{conf:.0%} fit")
                     col_badge.markdown(verdict_badge(fs), unsafe_allow_html=True)
@@ -422,48 +317,102 @@ with main_tab_screening:
         is_scanning = st.session_state.get(scanning_key, False)
 
         with st.expander("⚙️ Screening filters & settings", expanded=len(applicants) > 50):
-            # Stage filter
-            all_stages = sorted({
-                ((a.get("stage") or {}).get("name") if isinstance(a.get("stage"), dict) else a.get("stage")) or "Unknown"
-                for a in applicants
-            })
-            selected_stages = st.multiselect(
-                "Only screen applicants in these stages",
-                options=all_stages,
-                default=all_stages,
-                key="screen_stages",
+            # Stage filter — fetch sub_stages from job posting's interview_process
+            job_detail = load_job_detail(job_id)
+            interview_process = job_detail.get("interview_process") or {}
+            sub_stages_list = interview_process.get("sub_stages") or []
+
+            # Parent stage ordering & labels
+            _PARENT_ORDER = {"leads": 0, "candidature": 1, "screening": 2, "on_site": 3, "offer": 4, "hire": 5}
+            _PARENT_LABELS = {
+                "leads": "Leads", "candidature": "Candidature", "screening": "Screening",
+                "on_site": "On-Site / Interviews", "offer": "Offer", "hire": "Hire",
+            }
+
+            # Build parent → sub_stage names map (ordered by position)
+            parent_to_subs = {}
+            for s in sorted(sub_stages_list, key=lambda s: s.get("position", 0)):
+                parent_to_subs.setdefault(s.get("stage", ""), []).append(s["name"])
+
+            # Get unique parent stages present in the pipeline, in order
+            parent_keys = sorted(parent_to_subs.keys(), key=lambda k: _PARENT_ORDER.get(k, 99))
+
+            # Helper: get applicant's parent stage value
+            def _applicant_parent_stage(a):
+                sv = a.get("stage")
+                if isinstance(sv, dict):
+                    return sv.get("name") or "Unknown"
+                return sv or "Unknown"
+
+            # Count applicants per parent stage
+            parent_counts = {}
+            for a in applicants:
+                ps = _applicant_parent_stage(a)
+                parent_counts[ps] = parent_counts.get(ps, 0) + 1
+
+            # ── Level 1: Parent stage filter ──
+            parent_options = [k for k in parent_keys]
+            def _format_parent(key):
+                label = _PARENT_LABELS.get(key, key.replace("_", " ").title())
+                count = parent_counts.get(key, 0)
+                return f"{label} ({count})" if count else label
+
+            selected_parents = st.multiselect(
+                "Filter by stage",
+                options=parent_options,
+                default=[],
+                format_func=_format_parent,
+                key="screen_parent_stages",
                 disabled=is_scanning,
+                placeholder="Choose stages...",
             )
 
-            f_col1, f_col2 = st.columns(2)
-            max_to_screen = f_col1.number_input(
-                "Max profiles to screen",
-                min_value=1,
-                max_value=len(applicants),
-                value=min(50, len(applicants)),
-                step=10,
-                key="screen_max",
-                disabled=is_scanning,
-                help="Caps the number of AI screening calls. Use with stage filter to target the right pool first.",
+            # ── Level 2: Sub-stage filter (populated from selected parents) ──
+            available_subs = []
+            for p in selected_parents:
+                available_subs.extend(parent_to_subs.get(p, []))
+
+            selected_subs = st.multiselect(
+                "Filter by sub-stage",
+                options=available_subs,
+                default=available_subs,
+                key="screen_sub_stages",
+                disabled=is_scanning or not selected_parents,
+                placeholder="Select parent stages first..." if not selected_parents else "Choose sub-stages...",
             )
-            workers = f_col2.slider(
+
+            # Build filtered list: match applicant parent stage AND only if a sub in that parent is selected
+            # Since API only gives parent stage, we filter by parent but only if at least one sub of that parent is selected
+            active_parents = set()
+            for sub_name in selected_subs:
+                for p, subs in parent_to_subs.items():
+                    if sub_name in subs:
+                        active_parents.add(p)
+
+            if selected_subs:
+                stage_filtered = [
+                    a for a in applicants
+                    if _applicant_parent_stage(a) in active_parents
+                ]
+            else:
+                stage_filtered = []
+
+            workers = st.slider(
                 "Parallel workers",
-                min_value=1, max_value=5, value=3,
+                min_value=1, max_value=5, value=5,
                 key="screen_workers",
-                disabled=is_scanning,
+                disabled=is_scanning or not selected_subs,
                 help="How many profiles to screen simultaneously. Higher = faster but more API load.",
             )
 
-            # Build the filtered list and show a preview
-            pre_filtered = [
-                a for a in applicants
-                if (((a.get("stage") or {}).get("name") if isinstance(a.get("stage"), dict)
-                     else a.get("stage")) or "Unknown") in selected_stages
-            ][:int(max_to_screen)]
-            st.caption(
-                f"**{len(pre_filtered)}** of **{len(applicants)}** applicants will be screened "
-                f"({workers} at a time)."
-            )
+            pre_filtered = stage_filtered
+            if selected_subs:
+                st.caption(
+                    f"**{len(pre_filtered)}** of **{len(applicants)}** applicants will be screened "
+                    f"({workers} at a time)."
+                )
+            else:
+                st.caption("Select stages and sub-stages to begin screening.")
 
         # Store filtered queue in session state when scan starts
         scan_queue_key = f"scan_queue_{job_id}"
@@ -471,7 +420,7 @@ with main_tab_screening:
         # ── Button row ────────────────────────────────────────────────────────
         btn_col, stop_col = st.columns([2, 1])
         if btn_col.button("Screen & Rank All", type="primary", key="rank_all",
-                          disabled=is_scanning):
+                          disabled=is_scanning or not selected_subs):
             st.session_state[scanning_key]  = True
             st.session_state[scan_buf_key]  = []
             st.session_state[scan_queue_key] = pre_filtered   # snapshot the filtered list
@@ -545,7 +494,7 @@ with main_tab_screening:
             kw_col, btn_col, clear_col = st.columns([4, 1.2, 1])
             kw_input = kw_col.text_input(
                 "kw_rank_label",
-                placeholder="Filter by keywords (comma-separated) — e.g. Chandigarh University, entrepreneur, AWS",
+                placeholder="Smart filter — e.g. tier 1, FAANG experience, entrepreneur, D2C, startup",
                 label_visibility="collapsed",
                 key="kw_rank_input",
             )
@@ -558,52 +507,49 @@ with main_tab_screening:
                 st.rerun()
 
             if apply_kw_rank and kw_input.strip():
-                keywords = [k.strip() for k in kw_input.split(",") if k.strip()]
+                query = kw_input.strip()
                 matched = []
                 oai_kw = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-                prog_kw = st.progress(0, text="Filtering...")
+                prog_kw = st.progress(0, text="AI filtering...")
                 for i, r in enumerate(results):
                     resume_text = r.get("task_input", {}).get("resume_text", "") or r.get("name", "")
-                    resume_normalized = " ".join(resume_text.split()).lower()
-                    all_matched = True
-                    for kw in keywords:
-                        kw_lower = kw.lower()
-                        kw_found = False
-                        if kw_lower in resume_normalized:
-                            kw_found = True
-                        else:
-                            try:
-                                resp = oai_kw.chat.completions.create(
-                                    model="gpt-4o-mini",
-                                    max_tokens=10,
-                                    messages=[
-                                        {
-                                            "role": "system",
-                                            "content": (
-                                                "You are a smart candidate filter. Given a keyword/phrase and a resume, "
-                                                "reply ONLY 'yes' or 'no': does this resume match the keyword concept?\n"
-                                                "Be semantically intelligent:\n"
-                                                "- 'entrepreneur' → co-founded, startup founder, own business\n"
-                                                "- 'tier 1 college' → IIT, IIM, IISc, NIT, top-ranked university\n"
-                                                "- 'fintech' → payments, banking tech, neo-bank, lending\n"
-                                                "Match intent, not just exact words."
-                                            ),
-                                        },
-                                        {"role": "user", "content": f"Keyword: {kw}\n\nResume:\n{resume_text[:3000]}"},
-                                    ],
-                                )
-                                if resp.choices[0].message.content.strip().lower().startswith("yes"):
-                                    kw_found = True
-                            except Exception:
-                                kw_found = True
-                        if not kw_found:
-                            all_matched = False
-                            break
-                    if all_matched:
+                    try:
+                        resp = oai_kw.chat.completions.create(
+                            model="gpt-4o-mini",
+                            max_tokens=5,
+                            temperature=0,
+                            messages=[
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "You are a smart recruiter filter. Given a search query and a resume, "
+                                        "reply ONLY 'yes' or 'no'.\n\n"
+                                        "Be semantically intelligent — match INTENT, not just exact words:\n"
+                                        "- 'tier 1' or 'tier 1 college' → IIT, IIM, IISc, NIT, BITS Pilani, "
+                                        "Delhi University, NSUT, DTU, ISI, IIIT-H, top-50 NIRF-ranked institutions\n"
+                                        "- 'tier 2' → decent but non-elite: state universities, Amity, LPU, "
+                                        "Chandigarh Univ, Manipal, VIT, SRM, etc.\n"
+                                        "- 'entrepreneur' → co-founded, startup founder, own business, CEO of own venture\n"
+                                        "- 'fintech' → payments, banking tech, neo-bank, lending platform\n"
+                                        "- 'FAANG' → Google, Meta, Amazon, Apple, Netflix, Microsoft\n"
+                                        "- 'remote' → works remotely, distributed team\n"
+                                        "- 'startup experience' → early-stage company, Series A/B, small team\n"
+                                        "- 'D2C' → direct to consumer brand, Shopify, e-commerce brand\n"
+                                        "- 'product management' → PM, product manager, product owner, roadmap\n\n"
+                                        "For comma-separated queries, ALL criteria must match. "
+                                        "Think about what a recruiter means, not literal text."
+                                    ),
+                                },
+                                {"role": "user", "content": f"Query: {query}\n\nResume:\n{resume_text[:3000]}"},
+                            ],
+                        )
+                        if resp.choices[0].message.content.strip().lower().startswith("yes"):
+                            matched.append(r["applicant_id"])
+                    except Exception:
                         matched.append(r["applicant_id"])
                     prog_kw.progress((i + 1) / len(results))
                 prog_kw.empty()
-                st.session_state["kw_rank_active"] = kw_input.strip()
+                st.session_state["kw_rank_active"] = query
                 st.session_state["kw_rank_matched"] = matched
                 st.rerun()
 
@@ -826,7 +772,11 @@ with main_tab_screening:
                         location = loc_raw or "—"
                     emails = p.get("emails") or []
                     email = emails[0].get("email", "—") if emails and isinstance(emails[0], dict) else "—"
-                    skills = ", ".join(p.get("topSkills") or []) or "—"
+                    skills_data = p.get("topSkills") or []
+                    if isinstance(skills_data, str):
+                        skills = skills_data
+                    else:
+                        skills = ", ".join(s.get("name", s) if isinstance(s, dict) else str(s) for s in skills_data) or "—"
                     open_to_work = "  ✅ Open to Work" if p.get("openToWork") else ""
                     linkedin_url = p.get("linkedinUrl", "")
 

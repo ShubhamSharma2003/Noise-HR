@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(file \"d:/Desktop\"/*)",
+      "WebSearch",
+      "WebFetch(domain:developers.freshteam.com)",
+      "WebFetch(domain:support.freshteam.com)",
+      "WebFetch(domain:developers.freshworks.com)",
+      "WebFetch(domain:www.getknit.dev)",
+      "Bash(python -m venv .venv)",
+      "Bash(.venv/Scripts/pip install:*)",
+      "Bash(.venv/Scripts/python -c \":*)",
+      "Bash(.venv/Scripts/python run.py --screen 2000073751 2005027008)",
+      "Bash(python run.py)",
+      "Bash(pip install:*)",
+      "Bash(python run.py --screen 2000073751 2005027008)",
+      "Bash(python -c \":*)",
+      "Bash(python run.py --screen 2000073751 2005027411)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8501)",
+      "Bash(pkill -f \"streamlit run\")",
+      "Bash(streamlit run:*)",
+      "Bash(python -m streamlit --version)",
+      "Bash(python3 -m streamlit --version)",
+      "Bash(\"d:/Desktop/HR/app.py\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''d:/Desktop/HR/app.py''\\).read\\(\\)\\); print\\(''syntax OK''\\)\")"
+    ]
+  }
+}
