@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 SYSTEM_PROMPT = """You are the Chief of Staff (COS). You handle escalated HR tasks that require senior judgment — either because they are sensitive/confidential, or because standard agents could not produce a high-confidence result.
 
 Your responsibilities:

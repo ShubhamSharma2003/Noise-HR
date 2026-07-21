@@ -70,8 +70,12 @@ class FreshteamClient:
         try:
             return self._paginate("/job_postings")
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 403:
-                return []  # role can't list jobs — caller should use get_job_posting() instead
+            status = e.response.status_code if e.response is not None else None
+            if status in (401, 403, 404):
+                # 401 bad/expired key, 403 role lacks permission, 404 wrong subdomain —
+                # degrade to empty list so the caller falls back to manual Job ID entry.
+                print(f"[Freshteam] get_job_postings failed with HTTP {status} — check API key/subdomain")
+                return []
             raise
 
     def get_job_posting(self, job_id: int) -> dict:
@@ -108,7 +112,9 @@ class FreshteamClient:
         try:
             return self._paginate("/employees", params)
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 403:
+            status = e.response.status_code if e.response is not None else None
+            if status in (401, 403, 404):
+                print(f"[Freshteam] get_employees failed with HTTP {status} — check API key/subdomain")
                 return []
             raise
 

@@ -231,7 +231,10 @@ with main_tab_screening:
     jobs = load_jobs()
 
     if not jobs:
-        st.warning("Could not load jobs from Freshteam. Enter a Job ID manually.")
+        st.warning(
+            "Could not load jobs from Freshteam (auth/permission/subdomain issue — "
+            "see app logs for the HTTP status). Enter a Job ID manually below."
+        )
         if "manual_job_ids" not in st.session_state:
             st.session_state.manual_job_ids = [2000073751]
         if "job_titles" not in st.session_state:
