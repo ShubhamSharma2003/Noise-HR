@@ -88,7 +88,14 @@ class FreshteamClient:
 
     def get_applicants(self, job_id: int) -> list[dict]:
         """Return all applicants for a specific job posting."""
-        return self._paginate(f"/job_postings/{job_id}/applicants")
+        try:
+            return self._paginate(f"/job_postings/{job_id}/applicants")
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status in (401, 403, 404):
+                print(f"[Freshteam] get_applicants({job_id}) failed with HTTP {status} — check API key/subdomain")
+                return []
+            raise
 
     def get_applicant(self, job_id: int, applicant_id: int) -> dict:
         """Return details for a single applicant, including resume URLs."""
