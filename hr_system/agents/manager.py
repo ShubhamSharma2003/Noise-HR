@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from hr_system.state import HRState, ManagerDecision
-from hr_system.agents.base import call_llm, append_history
+from hr_system.agents.base import call_llm, append_history, MANAGER_MODEL
 from hr_system.prompts.manager import SYSTEM_PROMPT, build_user_prompt
 
 
@@ -14,7 +14,9 @@ def manager_node(state: HRState) -> dict:
         max_retries=state.get("max_retries", 3),
     )
 
-    raw: dict = call_llm(SYSTEM_PROMPT, user_prompt, expect_json=True)
+    # Manager only reviews the screener's writeup (never the resume), so it runs
+    # on a fast, cheap model — intelligence here buys little.
+    raw: dict = call_llm(SYSTEM_PROMPT, user_prompt, expect_json=True, model=MANAGER_MODEL)
 
     verdict = raw.get("verdict", "REJECT").upper()
     if verdict not in ("APPROVE", "REJECT"):

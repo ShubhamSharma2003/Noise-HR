@@ -1,10 +1,44 @@
 import io
+import hashlib
 import os
 import time
+import urllib.parse
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Extracted resume text is cached on disk so re-scans, filters, and the deep
+# screening pass don't re-download and re-parse PDFs from Freshteam.
+RESUME_CACHE_DIR = os.environ.get("HR_RESUME_CACHE_DIR", ".cache/resume_texts")
+
+
+def _resume_cache_path(cache_key: str, resume_url: str) -> str:
+    # Hash only scheme+host+path: S3 pre-signed URLs get a fresh signature in
+    # the query string on every listing, but the path identifies the file.
+    parts = urllib.parse.urlsplit(resume_url)
+    stable_url = f"{parts.scheme}://{parts.netloc}{parts.path}"
+    digest = hashlib.sha256(stable_url.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(RESUME_CACHE_DIR, f"{cache_key}-{digest}.txt")
+
+
+def _resume_cache_get(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _resume_cache_put(path: str, text: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except OSError:
+        pass  # cache is best-effort
 
 
 class FreshteamClient:
@@ -24,7 +58,15 @@ class FreshteamClient:
     def _get(self, path: str, params: dict = None, retries: int = 5) -> requests.Response:
         url = f"{self.base_url}{path}"
         for attempt in range(retries):
-            response = requests.get(url, headers=self.headers, params=params or {}, timeout=30)
+            try:
+                response = requests.get(url, headers=self.headers, params=params or {}, timeout=30)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                # Transient network hiccup (connection reset / timeout) — retry
+                # with backoff instead of crashing the whole app.
+                if attempt == retries - 1:
+                    raise
+                time.sleep(min(2 ** attempt, 30))
+                continue
             if response.status_code == 429 or response.status_code >= 500:
                 wait = min(2 ** attempt, 30)  # 1, 2, 4, 8, 16 … capped at 30s
                 retry_after = response.headers.get("Retry-After")
@@ -77,13 +119,20 @@ class FreshteamClient:
                 print(f"[Freshteam] get_job_postings failed with HTTP {status} — check API key/subdomain")
                 return []
             raise
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            # Network is down/slow — degrade to manual Job ID entry instead of
+            # crashing the app at startup.
+            print(f"[Freshteam] get_job_postings network error: {e}")
+            return []
 
     def get_job_posting(self, job_id: int) -> dict:
         """Return a single job posting by ID."""
         try:
             response = self._get(f"/job_postings/{job_id}")
             return response.json()
-        except requests.exceptions.HTTPError:
+        except (requests.exceptions.HTTPError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout):
             return {"id": job_id}  # return minimal stub so callers don't crash
 
     def get_applicants(self, job_id: int) -> list[dict]:
@@ -96,6 +145,9 @@ class FreshteamClient:
                 print(f"[Freshteam] get_applicants({job_id}) failed with HTTP {status} — check API key/subdomain")
                 return []
             raise
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            print(f"[Freshteam] get_applicants({job_id}) network error: {e}")
+            return []
 
     def get_applicant(self, job_id: int, applicant_id: int) -> dict:
         """Return details for a single applicant, including resume URLs."""
@@ -125,8 +177,23 @@ class FreshteamClient:
                 return []
             raise
 
-    def _fetch_resume_text(self, resume_url: str) -> str:
-        """Download a resume from Freshteam and return its text content."""
+    def _fetch_resume_text(self, resume_url: str, cache_key: str = None) -> str:
+        """Download a resume from Freshteam and return its text content.
+
+        When cache_key is given (e.g. the applicant id), the extracted text is
+        cached on disk and reused on later scans.
+        """
+        cache_path = _resume_cache_path(str(cache_key), resume_url) if cache_key else None
+        if cache_path:
+            cached = _resume_cache_get(cache_path)
+            if cached:
+                return cached
+        text = self._download_resume_text(resume_url)
+        if cache_path and text:
+            _resume_cache_put(cache_path, text)
+        return text
+
+    def _download_resume_text(self, resume_url: str) -> str:
         try:
             # S3 pre-signed URLs are self-authenticating — don't send auth headers
             headers = {} if "s3.amazonaws.com" in resume_url else self.headers
@@ -149,7 +216,7 @@ class FreshteamClient:
     # ── Convenience methods for task_input building ───────────────────────────
 
     def build_resume_screening_input(
-        self, job_id: int, applicant_id: int
+        self, job_id: int, applicant_id: int, job: dict = None
     ) -> dict:
         """
         Build the task_input dict for A1 (Resume Screener).
@@ -163,7 +230,9 @@ class FreshteamClient:
                 "applicant_name": str,
             }
         """
-        job = self.get_job_posting(job_id)
+        # Bulk scans pass the job posting in once instead of re-fetching it
+        # for every applicant.
+        job = job or self.get_job_posting(job_id)
         applicant = self.get_applicant(job_id, applicant_id)
 
         # Candidate info may be nested under "candidate" key (list endpoint)
@@ -177,7 +246,7 @@ class FreshteamClient:
         # Try to get resume text from the uploaded resume file
         resumes = candidate.get("resumes") or []
         resume_url = resumes[0].get("url") if resumes else None
-        resume_text = self._fetch_resume_text(resume_url) if resume_url else ""
+        resume_text = self._fetch_resume_text(resume_url, cache_key=applicant_id) if resume_url else ""
 
         # Fall back to structured profile if no resume file is available
         if not resume_text:

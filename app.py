@@ -10,6 +10,8 @@ from openai import OpenAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from hr_system.freshteam import FreshteamClient
 from hr_system.graph import hr_graph
+from hr_system.scan import ScanJob
+from hr_system.agents.base import MODEL as DEEP_MODEL, TRIAGE_MODEL
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="HR Agent System", page_icon="🧑‍💼", layout="wide")
@@ -78,25 +80,29 @@ st.divider()
 def format_resume(raw_text: str) -> str:
     if not raw_text or len(raw_text.strip()) < 20:
         return "_No resume content available._"
-    response = OpenAI(api_key=os.environ.get("OPENAI_API_KEY")).chat.completions.create(
-        model="gpt-4o",
-        max_tokens=1500,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a resume parser. Given raw text extracted from a resume file, "
-                    "reformat it into clean, structured markdown with these sections (only include "
-                    "sections that have actual data): \n"
-                    "## Name\n## Contact\n## Summary\n## Experience\n## Education\n## Skills\n## Certifications\n\n"
-                    "Use bullet points for lists. If the input does not look like a resume at all, "
-                    "respond with exactly: `[Not a resume — raw content shown below]`"
-                ),
-            },
-            {"role": "user", "content": raw_text[:6000]},
-        ],
-    )
-    return response.choices[0].message.content.strip()
+    try:
+        response = OpenAI(api_key=os.environ.get("OPENAI_API_KEY")).chat.completions.create(
+            model="gpt-4o",
+            max_tokens=1500,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a resume parser. Given raw text extracted from a resume file, "
+                        "reformat it into clean, structured markdown with these sections (only include "
+                        "sections that have actual data): \n"
+                        "## Name\n## Contact\n## Summary\n## Experience\n## Education\n## Skills\n## Certifications\n\n"
+                        "Use bullet points for lists. If the input does not look like a resume at all, "
+                        "respond with exactly: `[Not a resume — raw content shown below]`"
+                    ),
+                },
+                {"role": "user", "content": raw_text[:6000]},
+            ],
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        # Never let a formatting failure crash the caller — show the raw text.
+        return f"_(AI formatting unavailable: {str(e)[:120]})_\n\n```\n{raw_text[:6000]}\n```"
 
 @st.cache_data(show_spinner="Fetching jobs from Freshteam...", ttl=60)
 def load_jobs():
@@ -115,9 +121,9 @@ def applicant_label(a):
     name = f"{c.get('first_name','')} {c.get('last_name','')}".strip()
     return name or f"Applicant #{a['id']}"
 
-def run_screening(job_id, applicant_id):
+def run_screening(job_id, applicant_id, job=None):
     client = FreshteamClient()
-    task_input = client.build_resume_screening_input(job_id, applicant_id)
+    task_input = client.build_resume_screening_input(job_id, applicant_id, job=job)
     state = {
         "task_id": f"RS-{job_id}-{applicant_id}",
         "task_type": "resume_screening",
@@ -156,15 +162,34 @@ _VERDICT_RANK = {
     "NO_FIT":      5, "NO":         5,
 }
 
+_DIMENSION_KEYS = ("hard_skills", "experience", "education",
+                   "career_trajectory", "role_alignment", "red_flags")
+
+
+def _dimension_total(raw_json):
+    """Sum of the 6 sub-scores (each 1-10, higher = better). Used to break ties
+    when many candidates share the same coarse confidence % — the model scores
+    confidence in blunt steps, but the sub-scores separate similar resumes."""
+    dims = raw_json.get("dimension_scores") or {}
+    total = 0.0
+    for k in _DIMENSION_KEYS:
+        try:
+            total += float(dims.get(k, 0) or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
 def _verdict_sort_key(r):
-    """Primary: verdict rank (lower = better). Secondary: confidence descending."""
+    """Primary: verdict rank (lower = better). Secondary: confidence descending.
+    Tertiary: total sub-score descending (separates same-confidence clusters)."""
     if r.get("error"):
-        return (99, 0)
+        return (99, 0.0, 0.0)
     fs = r.get("final_state", {})
     raw_json = ((fs.get("agent_output") or {}).get("raw_json") or {})
     rec = raw_json.get("recommendation", "").upper().replace(" ", "_")
     rank = _VERDICT_RANK.get(rec, 6)
-    return (rank, -r.get("confidence", 0))
+    return (rank, -r.get("confidence", 0), -_dimension_total(raw_json))
 
 def verdict_badge(final_state):
     # Extract recommendation from agent output
@@ -283,12 +308,21 @@ with main_tab_screening:
 
         ranked_key    = f"ranked_results_{job_id}"
         scanning_key  = f"scanning_{job_id}"
-        scan_buf_key  = f"scan_buf_{job_id}"
+        scan_job_key  = f"scan_job_{job_id}"
+        scan_error_key = f"scan_error_{job_id}"   # hard failure message (shown as error)
+        scan_note_key  = f"scan_note_{job_id}"    # soft warning (e.g. deep stage failed)
 
-        # Clear stale keys from other jobs
+        # Clear stale scan state from other jobs; cancel any orphaned scan.
         for k in list(st.session_state.keys()):
-            if any(k.startswith(p) for p in ("ranked_results_", "scanning_", "scan_buf_")) \
-                    and not k.endswith(f"_{job_id}"):
+            if any(k.startswith(p) for p in (
+                "ranked_results_", "scanning_", "scan_job_", "scan_error_", "scan_note_",
+                # legacy keys from the old chunk-per-rerun scanner
+                "scan_buf_", "scan_queue_", "scan_stage_", "deep_queue_", "deep_buf_",
+            )) and not k.endswith(f"_{job_id}"):
+                if k.startswith("scan_job_"):
+                    old = st.session_state.get(k)
+                    if old is not None and hasattr(old, "cancel"):
+                        old.cancel()
                 del st.session_state[k]
 
         def _render_rank_card(r, rank, live=False):
@@ -302,12 +336,14 @@ with main_tab_screening:
                     f"https://gonoise.freshteam.com/hire/jobs/{job_id}"
                     f"/applicants/listview/{r['applicant_id']}"
                 )
+                stage_label = {"deep": "🔬 deep screened", "triage": "⚡ triage"}.get(r.get("stage"), "")
                 col_info.markdown(
                     f"**{r['name']}**  \nID: `{r['applicant_id']}` &nbsp;"
                     f'<a href="{ft_url}" target="_blank" style="text-decoration:none;">'
                     f'<button style="padding:2px 10px;font-size:12px;border-radius:5px;'
                     f'border:1px solid #ccc;background:#f0f2f6;cursor:pointer;">'
-                    f'🔗 Freshteam Profile</button></a>',
+                    f'🔗 Freshteam Profile</button></a>'
+                    + (f' &nbsp;<span style="font-size:11px;color:#6c757d;">{stage_label}</span>' if stage_label else ""),
                     unsafe_allow_html=True,
                 )
                 if err:
@@ -316,6 +352,8 @@ with main_tab_screening:
                 else:
                     col_conf.progress(max(conf, 0), text=f"{conf:.0%} fit")
                     col_badge.markdown(verdict_badge(fs), unsafe_allow_html=True)
+                if r.get("deep_error"):
+                    st.caption(f"⚠️ Deep screening failed — showing triage result. ({str(r['deep_error'])[:100]})")
                 if not live:
                     with st.expander("View full result"):
                         if err:
@@ -325,8 +363,19 @@ with main_tab_screening:
                             with res_tab:
                                 raw = r["task_input"].get("resume_text", "")
                                 if raw:
-                                    with st.spinner("Formatting resume..."):
-                                        st.markdown(format_resume(raw))
+                                    # Lazy: format with AI only on demand. Calling it
+                                    # for every card here would fire one gpt-4o request
+                                    # per applicant on render (collapsed expanders still
+                                    # execute), stalling and crashing large lists.
+                                    fmt_key = f"fmt_{r['applicant_id']}"
+                                    if st.session_state.get(fmt_key):
+                                        with st.spinner("Formatting resume..."):
+                                            st.markdown(format_resume(raw))
+                                    elif st.button("✨ Format with AI", key=f"fmtbtn_{r['applicant_id']}"):
+                                        st.session_state[fmt_key] = True
+                                        st.rerun()
+                                    else:
+                                        st.text(raw[:8000])
                                 else:
                                     st.caption("No resume file attached.")
                             with result_tab:
@@ -421,10 +470,13 @@ with main_tab_screening:
 
             workers = st.slider(
                 "Parallel workers",
-                min_value=1, max_value=5, value=5,
+                min_value=1, max_value=100, value=40,
                 key="screen_workers",
                 disabled=is_scanning or not selected_subs,
-                help="How many profiles to screen simultaneously. Higher = faster but more API load.",
+                help="How many profiles to screen simultaneously. LLM calls are "
+                     "network-bound, so higher is faster; rate-limit errors are "
+                     "retried automatically with backoff. Lower this only if scans "
+                     "keep hitting your OpenAI tier's limits.",
             )
 
             pre_filtered = stage_filtered
@@ -436,16 +488,12 @@ with main_tab_screening:
             else:
                 st.caption("Select stages and sub-stages to begin screening.")
 
-        # Store filtered queue in session state when scan starts
-        scan_queue_key = f"scan_queue_{job_id}"
-
         # ── Button row ────────────────────────────────────────────────────────
         btn_col, stop_col = st.columns([2, 1])
         if btn_col.button("Screen & Rank All", type="primary", key="rank_all",
                           disabled=is_scanning or not selected_subs):
-            st.session_state[scanning_key]  = True
-            st.session_state[scan_buf_key]  = []
-            st.session_state[scan_queue_key] = pre_filtered   # snapshot the filtered list
+            st.session_state[scan_job_key] = ScanJob(job_id, pre_filtered, workers=workers).start()
+            st.session_state[scanning_key] = True
             st.session_state.pop(ranked_key, None)
             st.session_state.pop("kw_rank_active", None)
             st.session_state.pop("kw_rank_matched", None)
@@ -453,64 +501,109 @@ with main_tab_screening:
 
         if stop_col.button("⏹ Stop", key="rank_stop",
                            disabled=not is_scanning):
+            job = st.session_state.get(scan_job_key)
+            if job is not None:
+                job.cancel()
+                merged = job.merged_results()   # keep whatever finished so far
+                merged.sort(key=_verdict_sort_key)
+                st.session_state[ranked_key] = merged
             st.session_state[scanning_key] = False
-            scanned = st.session_state.get(scan_buf_key, [])
-            if scanned:
-                scanned.sort(key=_verdict_sort_key)
-                st.session_state[ranked_key] = scanned
+            st.session_state.pop(scan_job_key, None)
             st.rerun()
 
-        # ── Live scanning: one batch per rerun ────────────────────────────────
+        # ── Live scanning: background ScanJob polled by a fragment ────────────
+        # The scan runs on its own thread (hr_system/scan.py): stage 1 triages
+        # every applicant on TRIAGE_MODEL, then survivors get a single-call
+        # deep screen on DEEP_MODEL. This fragment reruns ONLY itself every
+        # second to refresh progress, so the rest of the page — including the
+        # tab bar — stays interactive during a scan.
         if st.session_state.get(scanning_key, False):
-            scanned  = st.session_state[scan_buf_key]
-            queue    = st.session_state[scan_queue_key]
-            total    = len(queue)
-            done     = len(scanned)
-            w        = st.session_state.get("screen_workers", 3)
 
-            st.progress(done / total if total else 0, text=f"Screened {done}/{total}…")
+            @st.fragment(run_every="1s")
+            def _scan_monitor():
+                job = st.session_state.get(scan_job_key)
+                if job is None:
+                    st.session_state[scanning_key] = False
+                    st.rerun()
+                    return
 
-            # Render already-scanned cards (live — no expander)
-            for i, r in enumerate(scanned, 1):
-                _render_rank_card(r, i, live=True)
+                snap = job.snapshot()
 
-            if done < total:
-                batch_apps = queue[done:done + w]
-                names = ", ".join(applicant_label(a) for a in batch_apps)
-                with st.spinner(f"Scanning {done+1}–{min(done+w, total)}/{total}: {names}…"):
-                    batch_results = []
+                # Error messages are stashed in session_state (not st.error'd
+                # here) because st.rerun() discards anything drawn in this run;
+                # the main body renders them after the rerun.
+                if snap["error"] == "no_jd":
+                    st.session_state[scan_error_key] = (
+                        "Couldn't fetch the job description from Freshteam — scan "
+                        "stopped so candidates aren't ranked against an empty JD. "
+                        "Click 'Screen & Rank All' to retry.")
+                    st.session_state[scanning_key] = False
+                    st.session_state.pop(scan_job_key, None)
+                    st.rerun()
+                    return
+                if snap["error"]:
+                    merged = job.merged_results()
+                    merged.sort(key=_verdict_sort_key)
+                    st.session_state[ranked_key]   = merged
+                    st.session_state[scan_error_key] = (
+                        f"Scan stopped after an error: {snap['error']}. "
+                        f"Showing the {len(merged)} profile(s) screened before it failed.")
+                    st.session_state[scanning_key] = False
+                    st.session_state.pop(scan_job_key, None)
+                    st.rerun()
+                    return
 
-                    def _screen_one(app):
-                        name = applicant_label(app)
-                        aid  = app["id"]
-                        try:
-                            fs, ti = run_screening(job_id, aid)
-                            conf = (fs.get("agent_output") or {}).get("confidence_score", 0.0)
-                            return {"name": name, "applicant_id": aid, "confidence": conf,
-                                    "final_state": fs, "task_input": ti}
-                        except Exception as e:
-                            return {"name": name, "applicant_id": aid, "confidence": -1,
-                                    "error": str(e), "final_state": {}, "task_input": {}}
+                total = snap["total"]
+                st.progress(snap["triage_done"] / total if total else 0.0,
+                            text=f"Stage 1 · Triage ({TRIAGE_MODEL}): "
+                                 f"{snap['triage_done']}/{total}")
+                if snap["stage"] in ("deep", "done"):
+                    dt = snap["deep_total"]
+                    st.progress(snap["deep_done"] / dt if dt else 1.0,
+                                text=f"Stage 2 · Deep screening shortlist ({DEEP_MODEL}): "
+                                     f"{snap['deep_done']}/{dt}")
 
-                    with ThreadPoolExecutor(max_workers=w) as pool:
-                        futures = {pool.submit(_screen_one, a): a for a in batch_apps}
-                        for fut in as_completed(futures):
-                            batch_results.append(fut.result())
+                # Live peek at the most-recent completed triage cards.
+                for i, r in enumerate(job.recent_cards(6), 1):
+                    _render_rank_card(r, i, live=True)
 
-                scanned.extend(batch_results)
-                st.session_state[scan_buf_key] = scanned
-                st.rerun()
-            else:
-                # All done — sort and persist
-                scanned.sort(key=_verdict_sort_key)
-                st.session_state[ranked_key]   = scanned
-                st.session_state[scanning_key] = False
-                st.rerun()
+                if snap["stage"] == "done":
+                    merged = job.merged_results()
+                    merged.sort(key=_verdict_sort_key)
+                    # Surface a mass deep-stage failure instead of a silent green
+                    # "Done!" — e.g. every shortlisted candidate failed to screen.
+                    if snap["deep_total"] and snap["deep_failed"] >= snap["deep_total"]:
+                        st.session_state[scan_note_key] = (
+                            f"Deep screening failed for all {snap['deep_total']} shortlisted "
+                            f"candidate(s) — showing triage results. Check API limits/errors.")
+                    elif snap.get("deep_failed"):
+                        st.session_state[scan_note_key] = (
+                            f"Deep screening failed for {snap['deep_failed']} of "
+                            f"{snap['deep_total']} shortlisted candidate(s); those show triage results.")
+                    st.session_state[ranked_key]   = merged
+                    st.session_state[scanning_key] = False
+                    st.session_state.pop(scan_job_key, None)
+                    st.rerun()   # app-scope: leave scan mode, show final list
+
+            _scan_monitor()
+
+        # ── Scan error / notes (rendered in the body so they survive rerun) ───
+        scan_error = None
+        if not st.session_state.get(scanning_key, False):
+            scan_error = st.session_state.pop(scan_error_key, None)
+            scan_note  = st.session_state.pop(scan_note_key, None)
+            if scan_error:
+                st.error(scan_error)
+            if scan_note:
+                st.warning(scan_note)
 
         # ── Final ranked results (scan complete) ──────────────────────────────
         if ranked_key in st.session_state and not st.session_state.get(scanning_key, False):
             results = st.session_state[ranked_key]
-            st.success(f"Done! Ranked {len(results)} applicants.")
+            deep_n = sum(1 for r in results if r.get("stage") == "deep")
+            funnel = f" ({deep_n} deep screened, {len(results) - deep_n} triaged)" if deep_n else ""
+            if not scan_error:   # don't claim success when the scan errored out
+                st.success(f"Done! Ranked {len(results)} applicants{funnel}.")
             st.divider()
 
             kw_col, btn_col, clear_col = st.columns([4, 1.2, 1])
@@ -530,10 +623,28 @@ with main_tab_screening:
 
             if apply_kw_rank and kw_input.strip():
                 query = kw_input.strip()
-                matched = []
                 oai_kw = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
                 prog_kw = st.progress(0, text="AI filtering...")
-                for i, r in enumerate(results):
+                filter_system = (
+                    "You are a smart recruiter filter. Given a search query and a resume, "
+                    "reply ONLY 'yes' or 'no'.\n\n"
+                    "Be semantically intelligent — match INTENT, not just exact words:\n"
+                    "- 'tier 1' or 'tier 1 college' → IIT, IIM, IISc, NIT, BITS Pilani, "
+                    "Delhi University, NSUT, DTU, ISI, IIIT-H, top-50 NIRF-ranked institutions\n"
+                    "- 'tier 2' → decent but non-elite: state universities, Amity, LPU, "
+                    "Chandigarh Univ, Manipal, VIT, SRM, etc.\n"
+                    "- 'entrepreneur' → co-founded, startup founder, own business, CEO of own venture\n"
+                    "- 'fintech' → payments, banking tech, neo-bank, lending platform\n"
+                    "- 'FAANG' → Google, Meta, Amazon, Apple, Netflix, Microsoft\n"
+                    "- 'remote' → works remotely, distributed team\n"
+                    "- 'startup experience' → early-stage company, Series A/B, small team\n"
+                    "- 'D2C' → direct to consumer brand, Shopify, e-commerce brand\n"
+                    "- 'product management' → PM, product manager, product owner, roadmap\n\n"
+                    "For comma-separated queries, ALL criteria must match. "
+                    "Think about what a recruiter means, not literal text."
+                )
+
+                def _match_one(r):
                     resume_text = r.get("task_input", {}).get("resume_text", "") or r.get("name", "")
                     try:
                         resp = oai_kw.chat.completions.create(
@@ -541,35 +652,24 @@ with main_tab_screening:
                             max_tokens=5,
                             temperature=0,
                             messages=[
-                                {
-                                    "role": "system",
-                                    "content": (
-                                        "You are a smart recruiter filter. Given a search query and a resume, "
-                                        "reply ONLY 'yes' or 'no'.\n\n"
-                                        "Be semantically intelligent — match INTENT, not just exact words:\n"
-                                        "- 'tier 1' or 'tier 1 college' → IIT, IIM, IISc, NIT, BITS Pilani, "
-                                        "Delhi University, NSUT, DTU, ISI, IIIT-H, top-50 NIRF-ranked institutions\n"
-                                        "- 'tier 2' → decent but non-elite: state universities, Amity, LPU, "
-                                        "Chandigarh Univ, Manipal, VIT, SRM, etc.\n"
-                                        "- 'entrepreneur' → co-founded, startup founder, own business, CEO of own venture\n"
-                                        "- 'fintech' → payments, banking tech, neo-bank, lending platform\n"
-                                        "- 'FAANG' → Google, Meta, Amazon, Apple, Netflix, Microsoft\n"
-                                        "- 'remote' → works remotely, distributed team\n"
-                                        "- 'startup experience' → early-stage company, Series A/B, small team\n"
-                                        "- 'D2C' → direct to consumer brand, Shopify, e-commerce brand\n"
-                                        "- 'product management' → PM, product manager, product owner, roadmap\n\n"
-                                        "For comma-separated queries, ALL criteria must match. "
-                                        "Think about what a recruiter means, not literal text."
-                                    ),
-                                },
+                                {"role": "system", "content": filter_system},
                                 {"role": "user", "content": f"Query: {query}\n\nResume:\n{resume_text[:3000]}"},
                             ],
                         )
-                        if resp.choices[0].message.content.strip().lower().startswith("yes"):
-                            matched.append(r["applicant_id"])
+                        return r["applicant_id"], resp.choices[0].message.content.strip().lower().startswith("yes")
                     except Exception:
-                        matched.append(r["applicant_id"])
-                    prog_kw.progress((i + 1) / len(results))
+                        return r["applicant_id"], True  # fail open: keep the profile
+
+                matched = []
+                done_ct = 0
+                with ThreadPoolExecutor(max_workers=10) as pool:
+                    futures = [pool.submit(_match_one, r) for r in results]
+                    for fut in as_completed(futures):
+                        aid, ok = fut.result()
+                        if ok:
+                            matched.append(aid)
+                        done_ct += 1
+                        prog_kw.progress(done_ct / len(results))
                 prog_kw.empty()
                 st.session_state["kw_rank_active"] = query
                 st.session_state["kw_rank_matched"] = matched
@@ -585,8 +685,36 @@ with main_tab_screening:
                 if not display_results:
                     st.warning("No profiles matched. Try different keywords or click **✕ Clear**.")
 
+            # Re-sort at display time so the ranking (incl. the sub-score
+            # tiebreaker) applies even to results scanned before this ran.
+            display_results = sorted(display_results, key=_verdict_sort_key)
+
             st.divider()
-            for rank, r in enumerate(display_results, 1):
+
+            # Paginate — rendering hundreds of cards (each an expander with tabs)
+            # at once is slow and unwieldy; show a page at a time.
+            PER_PAGE = 25
+            total_n = len(display_results)
+            n_pages = max(1, (total_n + PER_PAGE - 1) // PER_PAGE)
+            page_key = f"rank_page_{job_id}"
+            cur = min(max(st.session_state.get(page_key, 1), 1), n_pages)
+
+            if n_pages > 1:
+                p1, p2, p3 = st.columns([1, 2, 1])
+                if p1.button("‹ Prev", disabled=cur <= 1, key=f"pg_prev_{job_id}"):
+                    st.session_state[page_key] = cur - 1
+                    st.rerun()
+                p2.markdown(
+                    f"<div style='text-align:center;padding-top:6px;'>Page {cur} of {n_pages} "
+                    f"· showing {(cur-1)*PER_PAGE+1}–{min(cur*PER_PAGE, total_n)} of {total_n}</div>",
+                    unsafe_allow_html=True,
+                )
+                if p3.button("Next ›", disabled=cur >= n_pages, key=f"pg_next_{job_id}"):
+                    st.session_state[page_key] = cur + 1
+                    st.rerun()
+
+            start = (cur - 1) * PER_PAGE
+            for rank, r in enumerate(display_results[start:start + PER_PAGE], start + 1):
                 _render_rank_card(r, rank, live=False)
 
     # ── Sub-tab 2: Single Applicant ───────────────────────────────────────────
